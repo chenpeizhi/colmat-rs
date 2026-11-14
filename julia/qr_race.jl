@@ -15,6 +15,7 @@ function target_input()
     randn(rng,256,256);randn(rng,1024,128);randn(rng,512,512)
     randn(rng,2048,256)
 end
+invoke_race(::Val{:rust_original},team,A,ex,b)=rust_call(team,A,UInt32(3))
 invoke_race(::Val{:rust},team,A,ex,b)=rust_call(team,A,UInt32(1))
 invoke_race(::Val{:rust_control},team,A,ex,b)=rust_call(team,A,UInt32(1))
 invoke_race(::Val{:old},team,A,ex,b)=qr_lab(A,ex;block=16)
@@ -43,7 +44,7 @@ function run_race(outdir,reps,block,modes)
     mkpath(outdir);BLAS.set_num_threads(any(m->m in (:shared,:structured_shared),modes) ? QR_RACE_WIDTH : 1)
     A=target_input();inputhash=bytes2hex(sha256(reinterpret(UInt8,vec(A))))
     ex=Team(QR_RACE_WIDTH;minwork=parse(Int,get(ENV,"QR_MINWORK","0")))
-    native=any(m->m in (:rust,:rust_control),modes)
+    native=any(m->m in (:rust,:rust_control,:rust_original),modes)
     team=native ? team_new(QR_RACE_WIDTH) : C_NULL
     native && team==C_NULL && error("Rust team")
     try

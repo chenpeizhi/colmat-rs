@@ -61,9 +61,19 @@ pub unsafe extern "C" fn compare_run(
 					a.self_adjoint_eigen(Side::Lower, par).expect("EVD"),
 				)
 			},
-			1 => {
+			1 | 3 => {
 				let factor = a.qr(par.reborrow());
-				let q = factor.compute_thin_Q(par);
+                // Same factor code and held team; kind 3 reconstructs the original
+                // compute_thin_Q with the public arbitrary-input sequence API.
+                let q = if kind == 1 { factor.compute_thin_Q(par) } else {
+                    use colmat::dyn_stack::{MemBuffer, MemStack};
+                    use colmat::linalg::householder::{apply_block_householder_sequence_on_the_left_in_place_scratch, apply_block_householder_sequence_on_the_left_in_place_with_conj};
+                    let k = m.min(n);
+                    let mut q = Mat::identity(m,k);
+                    let mut mem = MemBuffer::new(apply_block_householder_sequence_on_the_left_in_place_scratch::<f64>(m,factor.Q_coeff().nrows(),k));
+                    apply_block_householder_sequence_on_the_left_in_place_with_conj(factor.Q_basis(),factor.Q_coeff(),colmat::Conj::No,q.as_mut(),par,MemStack::new(&mut mem));
+                    q
+                };
 				Output::Qr { factor, q }
 			},
 			2 => Output::Svd(a.thin_svd(par).expect("SVD")),

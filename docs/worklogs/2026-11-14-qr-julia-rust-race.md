@@ -91,3 +91,21 @@ pending. Rust changes require four-scalar
 focused checks, the full library suite and low-level allocation checks before
 timing. This single-L3 shared host cannot satisfy the formal campaign's separate
 observer-cache requirement. 64-core scaling and formal adoption remain unverified.
+
+
+The direct identity-seed Rust candidate was dropped. Its source is frozen in
+`20261114-qr-race-rust-seeds-paired` and `...-rust-seeds-confirm`. A same-binary
+control reconstructing the original owning Q path gave target ratios
+0.893/0.909/0.897, but comparison with the frozen original binary gave only
+0.948/0.957/0.950. The 256-square/8T guard worsened from 2.93 to 3.43 ms
+(Q stage 0.710 to 0.768 ms); 1024×128 improved 6.18 to 5.73 ms and the 1T
+target 35.58 to 28.00 ms. The target and small-square guard do not justify
+carrying this extra specialization. Its full 825-test suite, allocation and
+no_std checks passed; rejection is performance-based. The same-binary control
+remains a diagnostic, not a replacement for frozen-binary acceptance.
+
+Next probe: expose the recursive panel's leaf width as an explicit parameter
+(default preserving the original width), scan it using low-level QR on the
+same input/team, and only then consider the owning tall-QR choice. This
+transfers Julia's measured small serial panels without changing generic Q
+application or hard-capping a parallel region.
