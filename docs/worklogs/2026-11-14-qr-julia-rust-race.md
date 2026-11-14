@@ -2,133 +2,145 @@
 
 ## Decisions
 
-The target is 2048×256 f64, eight threads, complete thin Q/R. Julia must beat
-current colmat by at least 1.05× before transferring an improvement to Rust.
-Repeat until Rust's whole-call time is at least 10% below the original baseline.
-The baseline production code is b292f474; no upstream revision was measured.
-The experimental branch starts at 0bbf72c9.
+The local target is 2048×256 f64, eight threads, the complete allocation-inclusive
+call producing thin Q and R. Julia must first beat current Rust by at least
+1.05×; transfer improvements to Rust until its whole-call time is at least 10%
+below the original Rust. The production baseline is b292f474 (the branch starts
+at 0bbf72c9, with identical production source). No upstream revision was measured.
 
-All variants use identical seeded input, with allocations inside the owning-call
-timing, on CPU set `1,3-9`. CPU 2 showed unrelated contention; CPU 17 is occupied
-by the user. Runtime creation, validation and preparatory GC are outside timing.
-Separate Rust and Julia processes avoid the mixed-runtime order effects seen in
-[the earlier comparison](2026-11-14-colmat-julia-comparison.md).
+The final Rust experiment carries two changes:
 
-Julia uses recursive Householder panels and colmat's inverse compact-WY
-coefficients. The useful design is small factor panels (16) and larger Q panels
-(64), rebuilt from the packed reflectors and tau inside timing. Q construction
-skips known zero columns and directly initializes each panel's identity columns.
-The selected Julia arm uses BLAS eight-thread products and serial panel control;
-the ThreadTeams variants use single-thread BLAS. These are alternative parallel
-backends, never nested active eight-thread teams. General EVD/SVD and old qr_lab
-are unchanged. Julia is a Float64 algorithm experiment, not a bitwise translation.
+- Identity-seeded Q construction skips columns whose seeds precede the active
+  reverse Householder panel. It serves owning Qr, low-level QR unitary and the
+  shared LQ identity-seeding path. Arbitrary-input Householder application is
+  unchanged. The skipped columns have exactly zero support in the active rows;
+  this property does not apply to general matrix inputs.
+- Owning Qr uses factor/Q blocks of 16 and recursive leaves of 8 when n≤256,
+  m≥2n, and the original recommended block exceeds 16. Other shapes retain the
+  original factor policy. The new `QrParams::recursion_leaf_size` defaults to 1,
+  preserving existing low-level QR, LQ and SVD choices. The caller still owns
+  the team; products use their cost-selected budget without a fixed thread cap.
 
-The transferable zero-prefix proof: during reverse application to an identity
-block with seed row offset s, columns j with s+j preceding the current panel
-have zero support in the active rows. They require no update. This property
-belongs to identity-seeded construction; arbitrary-input multiplication cannot
-use it. Restricting the target adds no buffers or parallel regions. Existing
-column partitioning still reads the panel per participating task: its shared
-operand traffic remains O(p*m*b), pending many-core measurement.
-
-## Rejected candidates and evidence
-
-Frozen sources and complete results are in the sibling colmat-benchmark tree,
-under `data/probes/` (the first prototype is under `probes/qr-julia-rust-race/`).
-These are scans on witch, not formal campaign acceptance.
-
-- `first-alignment`: aligned Julia 37.45 ms, prefix 35.41 ms, Rust 24.04 ms.
-  Native phase profile: factor 14.59 ms, Q 8.23 ms; Q merits specialization.
-- `20261114-qr-race-alignment-scan`: coefficient reuse and column-grain scan;
-  best prefix 28.75 ms versus Rust 20.74 ms, rejected.
-- `20261114-qr-race-merge-scan`: hierarchical coefficient merging/padding;
-  best prefix 29.60 ms versus Rust 20.78 ms, rejected.
-- `20261114-qr-race-leaf-scan`: larger serial leaves; best total 24.45 ms
-  versus Rust 20.92 ms, rejected.
-- `20261114-qr-race-noscale-pilot`: omitting redundant whole-input scaling
-  appeared to win (22.10 versus 23.47 ms). Mixed-runtime three-start confirmation
-  `20261114-qr-race-julia-confirm` failed: Julia 26.00/25.67/22.52 ms versus
-  Rust 24.05/24.15/20.63 ms. No production Rust change followed that pilot.
-- `20261114-qr-race-structured-pilot` and `...-structured-blockscan`: identity
-  structure alone insufficient. BLAS-parallel block 32 pilot 20.69 versus
-  Rust 23.09 ms; isolated `...-structured-confirm` failed the 1.05× criterion
-  in two starts (20.85 versus 20.94; 20.55 versus 20.96 ms).
-- `20261114-qr-race-reblock-scan`: independently scan factor/Q widths;
-  16/64 selected at 19.08 versus Rust 22.86 ms. Rebuilding coefficients is included.
+Julia's selected configuration uses factor panels 16, Q panels 64, identity
+structure, and eight-thread BLAS under serial panel control. Alternative
+ThreadTeams variants use BLAS=1. The Rust winner uses 16 for both stages:
+regrouping coefficients into larger Q panels cost more than it saved. Thus the
+competition transfers useful structure and tests parameters in each backend.
+The old qr_lab, eigh_lab and svd_lab entrypoints remain available.
 
 ## Verification conclusions and constraints
 
-`20261114-qr-race-reblock-confirm` fixes 16/64 before three fresh isolated-process
-starts, eleven repetitions each, alternating backend order. Julia/Rust medians
-in ms: 19.449/20.891, 16.619/23.061, 19.784/22.787. Speedups 1.074×, 1.388×,
-1.152×; all exceed 1.05×. Rust A/A labels agree within 0.4%. All six process
-affinity audits and numerical output checks pass. Raw load observations and
-outliers are retained. This establishes a local Julia lead, not a language
-ranking, saturation limit, or portable adoption result.
+The local 10% target is achieved. Final frozen-binary measurements are in sibling
+`colmat-benchmark/data/probes/20261114-qr-race-rust-block16-confirm/`, with frozen
+sources, both libraries, hashes, controller, all samples, process summaries,
+paired summaries and verification logs. This is machine-local probe evidence,
+not a published acceptance campaign.
 
-The Julia QR tests pass 566 assertions: recursive/tail panels, zero/rank loss,
-empty/tall/wide, extreme scale, poisoned unused coefficient triangles, panel
-reblocking, serial and ThreadTeams execution. Every timed output is additionally
-checked for reconstruction and orthogonality. The no-prescale path follows the
-Rust owning QR boundary; near-overflow behavior is not established by these tests.
+Each start launches baseline-before, candidate, baseline-after and Julia in
+separate processes, eleven repetitions each. Native A/A labels call identical
+code. The pairing is candidate median divided by the geometric mean of its
+flanking baseline medians, fixed in the controller declaration.
 
-The first Rust transfer skips zero-prefix columns in identity-seeded QR/LQ Q
-construction and the owning Qr methods. Generic application is unchanged.
-`20261114-qr-race-rust-prefix-confirm` retains three flanked baseline/candidate
-starts and guard cells: target whole-call ratios 1.010/1.072/0.960, insufficient
-for the target; Q alone fell from about 8.3 to 6.9 ms. Native factor timing also
-varied between processes despite unchanged factor code. The 1T guard fell from
-34.05 to 29.48 ms; 1024×128/8T and 256-square/8T stayed within 1%. Julia still
-leads the candidate at 19.62/19.18/19.59 versus 22.04/22.08/22.03 ms.
-This transfer is a prerequisite experiment, not an 8T improvement claim.
-825 library tests pass (162 ignored), including four-scalar reconstruction,
-orthogonality, old-sequence oracle, row-major output and tail panels. The
-process-wide allocation test passes, including the new 4T/8T thin-Q calls.
+| Start | Original Rust, flanks' geometric mean (ms) | Improved Rust (ms) | Julia (ms) | Time reduction |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 23.018 | 14.586 | 19.451 | 36.63% |
+| 1 | 21.777 | 18.070 | 19.165 | 17.02% |
+| 2 | 23.032 | 14.646 | 19.510 | 36.41% |
 
-The next hypothesis is to avoid projecting a panel against columns that are
-still its identity seeds, as the Julia candidate does. The 10% target remains
-pending. Rust changes require four-scalar
-focused checks, the full library suite and low-level allocation checks before
-timing. This single-L3 shared host cannot satisfy the formal campaign's separate
-observer-cache requirement. 64-core scaling and formal adoption remain unverified.
+Median reduction is 36.41% (1.573×). All three exceed 10%, even against the
+faster individual flank (worst ratio 0.8794). Target A/A medians differ by at
+most 0.53%. Start 1's baseline drifts 23.079→20.548 ms; retain this variation
+and the candidate's 14.6–18.1 ms range rather than treating 36% as a portable
+expectation. The improved Rust also beats Julia in each final cohort.
 
+Reference guards, one process per binary and seven repetitions: 2048×256/1T
+33.909→27.271 ms; 1024×128/8T 6.127→5.606 ms; 256-square/8T 3.349→2.970 ms.
+The small-square candidate's A/A labels differ by 10.54%, so its apparent
+improvement is unresolved, not a positive performance conclusion. No guard
+shows a measured regression, but these scans do not establish formal acceptance.
 
-The direct identity-seed Rust candidate was dropped. Its source is frozen in
-`20261114-qr-race-rust-seeds-paired` and `...-rust-seeds-confirm`. A same-binary
-control reconstructing the original owning Q path gave target ratios
-0.893/0.909/0.897, but comparison with the frozen original binary gave only
-0.948/0.957/0.950. The 256-square/8T guard worsened from 2.93 to 3.43 ms
-(Q stage 0.710 to 0.768 ms); 1024×128 improved 6.18 to 5.73 ms and the 1T
-target 35.58 to 28.00 ms. The target and small-square guard do not justify
-carrying this extra specialization. Its full 825-test suite, allocation and
-no_std checks passed; rejection is performance-based. The same-binary control
-remains a diagnostic, not a replacement for frozen-binary acceptance.
+All 315 timed outputs pass reconstruction/orthogonality validation, and all 18
+process affinity audits pass. The final library suite passes 827 tests, with
+162 ignored. Focused tests cover f32/f64/c32/c64, recursion leaves 1..48,
+two panels plus tails, zero/rank loss, row-major borrowed input/output, thin/full
+Q and complement, policy boundaries at 256/257 columns and aspect 2, and repeat
+Q construction at a fixed count. Serial leaf sweeps passed before the held-team
+sweeps; final owning-policy tests use a held team of four. The process-wide
+allocator test passes: factor block16/leaf8 and thin Q allocate nothing after
+warm-up on held teams of four/eight with preallocated buffers. Owning calls
+intentionally allocate; their allocation counts are not reported as zero.
+The no-default-features library check passes. Julia passes 566 new QR assertions
+and 1,170 existing laboratory assertions.
 
-Next probe: expose the recursive panel's leaf width as an explicit parameter
-(default preserving the original width), scan it using low-level QR on the
-same input/team, and only then consider the owning tall-QR choice. This
-transfers Julia's measured small serial panels without changing generic Q
-application or hard-capping a parallel region.
+All measurements use identical input bytes (seed 84, fixture draw order retained)
+and CPU IDs `1,3-9`, eight physical cores within the user's 1..16 limit. CPU 2
+showed contention; CPU 17/35 are excluded. Pool creation, validation copies,
+preparatory GC and a 20 ms settle are outside timing; input/output/workspace
+allocation is inside. Runtime and BLAS arms run in separate processes after
+[the earlier comparison](2026-11-14-colmat-julia-comparison.md) exposed order
+sensitivity. Phase profiles are separate calls and must not be subtracted from
+whole-call medians as if they shared allocator/cache state.
 
+This is a shared, single-L3 host with turbo enabled. All 18 broad endpoint idle
+flags fail (they conservatively include CPU 2 and the full 1..16 domain and SMT
+siblings); no failed observation was retried away. The target comparison has
+stable within-process A/A controls but substantial between-process variation.
+The experiment remains EXPERIMENT: 64-core/NUMA scaling, every affected campaign
+shape, four-dtype performance, independent observer cache and formal vendor
+acceptance remain unverified. Shapes beyond the measured 512..4096 rows and
+128/256 columns are not established by the selected policy.
 
-`20261114-qr-race-rust-leaf-scan` tests root block 48 with leaf widths
-1/4/8/12/16/24/48 on the same binary and team. Median factor times across
-three starts (ms) are 12.342/12.344/11.963/11.589/11.596/12.242/16.369.
-A duplicate leaf-1 label agrees within 0.3%. Select 12 as the smallest width on
-the best plateau; 48 is rejected. This RawQr probe includes explicit R copying
-and differs from owning Qr; only its stage comparison selects the parameter.
+The leaf adds serial O(m*n*leaf) panel work. Existing column splits still read
+the panel per participating task, O(p*m*b) shared-operand traffic; no new
+per-thread full matrix or serial combine is introduced. Zero-prefix restriction
+adds no scratch, and changing panel/leaf sizes uses existing scratch queries.
+No proprietary implementation was inspected or used as algorithmic source.
 
-`QrParams::recursion_leaf_size` defaults to 1, preserving low-level QR, LQ and
-SVD choices. The owning Qr constructor explicitly tries 12. This changes panel
-grouping, not the available thread count; trailing products retain their full
-cost-selected budget. Larger leaves add serial O(m*n*leaf) work, so many-core
-scaling remains a necessary unverified acceptance condition.
+## Rejected candidates and selection evidence
 
-The owning-call pilot `20261114-qr-race-rust-leaf12-pilot` gives baseline flanks
-23.019/22.760 ms, candidate 21.285 ms (ratio 0.930), Julia 19.311 ms. The
-10% target is still unmet; this is a pilot, not three-start acceptance. The
-826-test library suite passes (162 ignored), with four-scalar leaf sweeps on
-a held team of four; earlier serial sweeps also passed. Factor and Q regions
-allocate zero at 4T/8T with preallocated output/scratch. The next hypothesis
-transfers Julia's independently sized factor/Q panels, including coefficient
-regrouping in the owning-call cost.
+Complete sources/results live in sibling `colmat-benchmark/data/probes/` unless
+otherwise noted. These are scans; only the final three-cohort frozen-binary
+comparison above establishes the local target.
+
+- Initial inverse-WY alignment: 37.45 ms versus Rust 24.04; skipping zero Q
+  columns gave 35.41. Frozen under `probes/qr-julia-rust-race/first-alignment`.
+  Native phase diagnostics (factor 14.59, Q 8.23 ms) justified investigating Q.
+- `20261114-qr-race-alignment-scan`, `...-merge-scan`, `...-leaf-scan`:
+  coefficient reuse, hierarchical merging, grains/padding and larger serial
+  leaves did not win; best totals 28.75/29.60/24.45 ms versus respective Rust
+  20.74/20.78/20.92 ms. Retain these failures rather than retrying them later.
+- `...-noscale-pilot` appeared to win after omitting redundant whole-input
+  normalization. Mixed-runtime `...-julia-confirm` failed: Julia
+  26.00/25.67/22.52 versus Rust 24.05/24.15/20.63 ms. No Rust change followed
+  that pilot. `...-structured-pilot`, `...-structured-blockscan` and isolated
+  `...-structured-confirm` also failed the 1.05× criterion in two starts.
+- Julia `...-reblock-scan` selected 16/64. `...-reblock-confirm` fixed it before
+  three isolated starts: Julia 19.449/16.619/19.784 versus Rust
+  20.891/23.061/22.787 ms; speedups 1.074/1.388/1.152×. This established the
+  required Julia lead before the first Rust transfer. Its no-prescale path's
+  near-overflow behavior remains unverified; extreme-scale fixtures pass.
+- Rust `...-rust-prefix-confirm`: Q fell approximately 8.3→6.9 ms, but target
+  whole-call ratios 1.010/1.072/0.960 did not establish an 8T improvement alone.
+  The 1T guard improved 34.05→29.48 ms; small 8T guards stayed within 1%.
+- Direct identity-seed Rust specialization was dropped. Its source is frozen
+  in `...-rust-seeds-paired` and `...-rust-seeds-confirm`. Same-binary original-Q
+  controls suggested ratios 0.893/0.909/0.897, but frozen-binary ratios were
+  0.948/0.957/0.950 and the square guard worsened 2.93→3.43 ms. Numerical,
+  allocation and no_std checks passed; rejection was performance-based. The
+  diagnostic original-Q control remains; after changing factor policy it is
+  an original-Q control only, not an original whole-QR baseline.
+- `...-rust-leaf-scan`: root48 factor medians for leaves 1/4/8/12/16/24/48
+  were 12.342/12.344/11.963/11.589/11.596/12.242/16.369 ms. Owning leaf12
+  pilot `...-rust-leaf12-pilot` reached ratio 0.930, short of the target.
+  The unconditional owning leaf12 policy was replaced by the final scoped one.
+- `...-rust-reblock-scan`: factor/Q/leaf 16/16/8 wins in all three starts
+  (whole RawQr 16.82/16.79/14.72 ms), against 48/48/12
+  (20.10/20.17/18.08). Regrouping to 16/64/8 cost 17.96/17.87/15.80 ms;
+  32/32/8 and unblocked leaf16 also lost. RawQr differs from owning Qr and is
+  used only to select parameters. Its controller inherited factor-only wording;
+  a selection clarification retaining whole-call cost was recorded before
+  inspecting results, and is preserved alongside it.
+- `...-rust-shape-scan` checks the selected tuple at 1024×128, 512×256,
+  1024×256 and 4096×256 (raw total reductions about 12/16/3/15% against the
+  original factor policy under the same Q constructor). Square and 512-column
+  probes do not broaden the final policy; their full results remain recorded.

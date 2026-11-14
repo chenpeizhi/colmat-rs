@@ -122,6 +122,22 @@ Block width and floor (`bidiag.rs`), the dqds back-off factor, the padding thres
 scan in the worklog and a one-line summary next to the constant. A threshold without its table is a
 guess.
 
+## Measure factor panels and Q construction together
+
+The best recursive leaf and outer block are separate choices. At 2048×256 f64,
+8T, root48/leaf12 took 11.59 ms for factor kernels; root16/leaf8 took 7.97 ms,
+while Q kernels grew only 4.92→5.20 ms. A wider leaf16 was slower than leaf8.
+Julia benefited from factor16/Q64, but regrouping Rust coefficients into Q64
+cost more than it saved: its best pair was16/16. Transfer the hypothesis and
+measure the backend's full call, including allocations and regrouping.
+
+Identity-seeded reverse Householder application can skip columns whose seed
+rows precede the current block; arbitrary-input multiplication cannot. Restrict
+that optimization to the construction boundary. Same-binary phase controls can
+be informative without matching frozen-binary whole-call gains; retain both.
+These are local 8T experiments, not many-core acceptance. [Evidence and rejected
+candidates](docs/worklogs/2026-11-14-qr-julia-rust-race.md).
+
 ## A panel made of short regions is hidden, not split further
 
 The blocked QR's panel at 4096 is 121 ms at 16T and barely shrinks with the thread count or the block

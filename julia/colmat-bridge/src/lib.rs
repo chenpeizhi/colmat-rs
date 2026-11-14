@@ -78,18 +78,33 @@ pub unsafe extern "C" fn compare_run(
 				Output::Qr { factor, q }
 			},
 			2 => Output::Svd(a.thin_svd(par).expect("SVD")),
-            100..=164 => {
+            100..=999999 => {
                 use colmat::dyn_stack::{MemBuffer,MemStack};
                 use colmat::linalg::qr::no_pivoting::{factor,unitary};
-                let k=m.min(n);let b=48.min(k).max(1);
-                let mut packed=a.to_owned();let mut h=Mat::zeros(b,k);
-                let params=colmat::Spec::new(factor::QrParams { recursion_leaf_size:(kind-100) as usize, ..<factor::QrParams as colmat::Auto<f64>>::auto() });
+                let k=m.min(n);let code=(kind-100) as usize;
+                let b=if (code/100)%100==0 {48} else {(code/100)%100};
+                let qb=if code/10000==0 {b} else {code/10000};
+                assert!(qb>=b && qb%b==0);
+                let b=b.min(k).max(1);let qb=qb.min(k).max(1);
+                let mut packed=a.to_owned();let mut h=Mat::zeros(qb,k);
+                let params=colmat::Spec::new(factor::QrParams { recursion_leaf_size:code%100, ..<factor::QrParams as colmat::Auto<f64>>::auto() });
                 let mut mem=MemBuffer::new(factor::qr_in_place_scratch::<f64>(m,n,b,par.shape(),params));
                 let t=std::time::Instant::now();
-                factor::qr_in_place(packed.as_mut(),h.as_mut(),par.reborrow(),MemStack::new(&mut mem),params);
+                factor::qr_in_place(packed.as_mut(),h.as_mut().subrows_mut(0,b),par.reborrow(),MemStack::new(&mut mem),params);
+                if qb!=b {
+                    for p in (0..k).step_by(qb) {
+                        let len=qb.min(k-p);
+                        for sub in (b..len).step_by(b) {
+                            for j in 0..b.min(len-sub) { for i in 0..=j {
+                                h[(sub+i,p+sub+j)]=h[(i,p+sub+j)];
+                            }}
+                        }
+                        colmat::linalg::householder::upgrade_householder_factor(h.as_mut().submatrix_mut(0,p,len,len),packed.as_ref().submatrix(p,p,m-p,len),len,b,par.reborrow());
+                    }
+                }
                 let tf=t.elapsed().as_secs_f64();
                 let mut q=Mat::zeros(m,k);
-                let mut mem=MemBuffer::new(unitary::unitary_scratch::<f64>(m,n,k,b,par.shape()));
+                let mut mem=MemBuffer::new(unitary::unitary_scratch::<f64>(m,n,k,qb,par.shape()));
                 let t=std::time::Instant::now();
                 unitary::unitary(q.as_mut(),packed.as_ref(),h.as_ref(),false,par.reborrow(),MemStack::new(&mut mem));
                 let tq=t.elapsed().as_secs_f64();

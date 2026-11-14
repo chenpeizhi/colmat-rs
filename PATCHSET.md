@@ -8,20 +8,21 @@ upstream `faer`.
 - **EXPERIMENT**: `julia/` provides Float64 Householder QR, tridiagonal and
   blocked bidiagonal reduction, repair kernels, and ThreadTeams execution to
   investigate decomposition headroom (#84 and #82). Terminal solvers use Julia
-  stdlib; no Rust production path changes or performance adoption are claimed.
+  stdlib; performance adoption remains pending.
   [Algorithm boundaries, verification and local evidence](docs/worklogs/2026-11-14-julia-decomposition-lab.md).
   [Same-input Rust/Julia comparison](docs/worklogs/2026-11-14-colmat-julia-comparison.md)
   records separate-process measurements and the rejected mixed-runtime method.
 
 ## Pending QR competition
 
-- **EXPERIMENT**: colmat-style Julia QR probes with independent factor/Q panel
-  widths and identity-seeded Q construction; three isolated starts beat the
-  original Rust by at least 1.05× at 2048×256 f64, 8T. Rust now skips known-zero
-  columns during identity-seeded Q construction; Q time improved in local
-  probes; owning Qr also tries 12-column recursive leaves, while the
-  low-level default stays at 1. The 8T whole-call target is not established;
-  this is local headroom evidence for #84, not adoption.
+- **EXPERIMENT**: Julia/Rust QR competition for #84. Owning Qr uses block16,
+  leaf8 at n≤256 and m≥2n when the recommended block exceeds16; other factor
+  policies and the low-level default are preserved. Identity-seeded Q skips
+  known-zero columns (also the shared LQ seeding path). At 2048×256 f64/8T,
+  three frozen-binary cohorts shorten the complete thin-Q/R call by
+  36.6%/17.0%/36.4%; all beat the Julia challenger. 827 library tests, held-team
+  factor/Q allocation checks and no_std check pass. Shared-host scan only;
+  broad campaign, four-dtype performance and 64-core adoption remain pending.
   [Decisions, rejected candidates and evidence](docs/worklogs/2026-11-14-qr-julia-rust-race.md).
 
 ## Pending EVD experiment
