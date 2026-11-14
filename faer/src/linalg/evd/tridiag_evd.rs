@@ -1,4 +1,5 @@
 use super::EvdError;
+mod repair;
 use crate::internal_prelude::*;
 use crate::perm::swap_cols_idx;
 use crate::utils::thread::join_raw;
@@ -602,24 +603,15 @@ fn divide_and_conquer_recurse<T: RealField>(
 		non_deflated,
 		par.reborrow(),
 	);
-	for i in 0..non_deflated {
-		let di = &permuted_diag[i].copy();
-		let mu_i = &mus[i].copy();
-		let shift_i = &shifts[i].copy();
-		let mut prod = mu_i + (shift_i - di);
-		(0..i).chain(i + 1..non_deflated).for_each(|k| {
-			let dk = &permuted_diag[k].copy();
-			let mu_k = &mus[k].copy();
-			let shift_k = &shifts[k].copy();
-			let numerator = &(mu_k + (shift_k - di));
-			let denominator = &(dk - di);
-			prod *= numerator / denominator;
-		});
-		let prod = prod.abs().sqrt();
-		let zi = permuted_z.rb_mut().at_mut(i);
-		let new_zi = if *zi < zero() { -prod } else { prod };
-		*zi = new_zi;
-	}
+	repair::weights(
+		permuted_z.rb_mut(),
+		permuted_diag.rb(),
+		mus.rb(),
+		shifts.rb(),
+		non_deflated,
+		par.reborrow(),
+	);
+
 	let mut eigenvals = z;
 	for i in 0..n {
 		eigenvals[i] = &mus[i] + &shifts[i];
@@ -646,26 +638,19 @@ fn divide_and_conquer_recurse<T: RealField>(
 			*p = pl_before[*p];
 		}
 	}
-	for (j, &pj) in pr.iter().enumerate() {
-		if pj >= non_deflated {
-			repaired_u.rb_mut().col_mut(j).fill(zero());
-			repaired_u[(pl_after[pj], j)] = one();
-		} else {
-			let mu_j = &mus[pj].copy();
-			let shift_j = &shifts[pj].copy();
-			for (i, &pl_after) in pl_after[..non_deflated].iter().enumerate() {
-				let zi = &permuted_z[i].copy();
-				let di = &permuted_diag[i].copy();
-				repaired_u[(pl_after, j)] = zi / ((di - shift_j) - mu_j);
-			}
-			for &pl_after in &pl_after[non_deflated..non_deflated + deflated] {
-				repaired_u[(pl_after, j)] = zero();
-			}
-			let inv_norm = &repaired_u.rb().col(j).norm_l2().recip();
-			z!(repaired_u.rb_mut().col_mut(j))
-				.for_each(|unzip!(x)| *x *= inv_norm);
-		}
-	}
+	repair::vectors(
+		repaired_u.rb_mut(),
+		pr,
+		pl_after,
+		permuted_diag.rb(),
+		permuted_z.rb(),
+		mus.rb(),
+		shifts.rb(),
+		non_deflated,
+		deflated,
+		par.reborrow(),
+	);
+
 	if applied_householder {
 		let mut idx = 0;
 		while idx < n {
