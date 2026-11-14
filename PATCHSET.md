@@ -17,7 +17,9 @@ upstream `faer`.
 
 - **EXPERIMENT**: colmat-style Julia QR probes with independent factor/Q panel
   widths and identity-seeded Q construction; three isolated starts beat the
-  original Rust by at least 1.05× at 2048×256 f64, 8T. Rust transfer pending;
+  original Rust by at least 1.05× at 2048×256 f64, 8T. Rust now skips known-zero
+  columns during identity-seeded Q construction; Q time improved in local
+  probes, but the 8T whole-call target is not established;
   this is local headroom evidence for #84, not adoption.
   [Decisions, rejected candidates and evidence](docs/worklogs/2026-11-14-qr-julia-rust-race.md).
 

@@ -1,12 +1,16 @@
 # Run each runtime in a separate process; shared variants use BLAS parallelism.
 include("compare_common.jl")
 using Statistics
+const QR_RACE_WIDTH=parse(Int,get(ENV,"QR_WIDTH","8"))
+const QR_RACE_M=parse(Int,get(ENV,"QR_M","2048"))
+const QR_RACE_N=parse(Int,get(ENV,"QR_N","256"))
 const QR_RACE_BASISBLOCK=parse(Int,get(ENV,"QR_BASISBLOCK","0"))
 const QR_RACE_PRESCALE=get(ENV,"QR_PRESCALE","1")=="1"
 const QR_RACE_LEAF=parse(Int,get(ENV,"QR_LEAF","3"))
 const QR_RACE_PAD=get(ENV,"QR_PAD_BASIS","0")=="1"
 const QR_RACE_GRAIN=parse(Int,get(ENV,"QR_COLGRAIN","1"))
 function target_input()
+    (QR_RACE_M,QR_RACE_N)!=(2048,256) && return randn(MersenneTwister(84),QR_RACE_M,QR_RACE_N)
     rng=MersenneTwister(84)
     randn(rng,256,256);randn(rng,1024,128);randn(rng,512,512)
     randn(rng,2048,256)
@@ -36,11 +40,11 @@ end
 function run_race(outdir,reps,block,modes)
     ispath(outdir) && error("new output directory required")
     any(m->m in (:shared,:structured_shared),modes) && length(modes)!=1 && error("shared BLAS requires its own process")
-    mkpath(outdir);BLAS.set_num_threads(any(m->m in (:shared,:structured_shared),modes) ? 8 : 1)
+    mkpath(outdir);BLAS.set_num_threads(any(m->m in (:shared,:structured_shared),modes) ? QR_RACE_WIDTH : 1)
     A=target_input();inputhash=bytes2hex(sha256(reinterpret(UInt8,vec(A))))
-    ex=Team(8;minwork=parse(Int,get(ENV,"QR_MINWORK","0")))
+    ex=Team(QR_RACE_WIDTH;minwork=parse(Int,get(ENV,"QR_MINWORK","0")))
     native=any(m->m in (:rust,:rust_control),modes)
-    team=native ? team_new(8) : C_NULL
+    team=native ? team_new(QR_RACE_WIDTH) : C_NULL
     native && team==C_NULL && error("Rust team")
     try
         for _ in 1:2, mode in modes;trial(Val(mode),team,A,ex,block);end
@@ -66,7 +70,7 @@ function run_race(outdir,reps,block,modes)
             end
         end
         open(joinpath(outdir,"metadata.txt"),"w") do io
-            println(io,"Target2048x256, thin Q/R,8 threads, BLAS=",BLAS.get_num_threads(),", Julia=",VERSION)
+            println(io,"Target $(size(A)), thin Q/R,$QR_RACE_WIDTH threads, BLAS=",BLAS.get_num_threads(),", Julia=",VERSION)
             println(io,"Rust binary=",RUST_LIB,"; input_sha256=",inputhash)
             println(io,"modes=$modes; block=$block; reps=$reps; grain=$QR_RACE_GRAIN; leaf=$QR_RACE_LEAF; basisblock=$QR_RACE_BASISBLOCK; pad=$QR_RACE_PAD; prescale=$QR_RACE_PRESCALE; owning-call allocations included")
             print(io,read("/proc/self/status",String))

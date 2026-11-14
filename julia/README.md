@@ -172,3 +172,38 @@ Julia の規格化処理と GC なども差に含まれ、言語・コンパイ�
 
 [直接比較の結果と制約](../docs/worklogs/2026-11-14-colmat-julia-comparison.md) に、
 分離後の全1,080サンプルと負荷によるばらつきを記録しています。
+
+## Julia と Rust の QR 競争
+
+`qr_colmat_lab` は別の実験用経路です。再帰パネルと逆compact WY形式を使い、
+`structured=true` ではQ生成の既知のゼロ領域・単位行列を利用します。
+`basisblock` は分解用の `block` と別に指定でき、係数の再構築時間も含みます。
+look-ahead と Rust の SIMD・コストモデルは再現していません。
+
+```julia
+# ThreadTeams で分割する場合
+BLAS.set_num_threads(1)
+F = qr_colmat_lab(A, Team(8); block=16, leaf=16, basisblock=64,
+                 structured=true, prescale=false)
+# BLAS に並列化を任せる比較候補。Julia の並列区間は作らない。
+BLAS.set_num_threads(8)
+F = qr_colmat_lab(A, Serial(); block=16, leaf=16, basisblock=64,
+                 structured=true, prescale=false)
+```
+
+追加の数値検証は `julia/test/qr_colmat.jl`。
+`qr_race.jl` は比較用の private bridge を使い、出力の検証を計測外で行います。
+Julia と Rust は別プロセスで起動します。
+
+```sh
+OPENBLAS_NUM_THREADS=1 QR_LEAF=16 QR_PRESCALE=0 QR_BASISBLOCK=64 \
+  taskset -c 1,3-9 julia --project=julia -t 8,0 \
+  julia/qr_race.jl /tmp/qr-julia-new 11 16 structured_shared
+OPENBLAS_NUM_THREADS=1 COLMAT_COMPARE_LIB=/absolute/path/to/frozen-baseline.so \
+  taskset -c 1,3-9 julia --project=julia -t 8,0 \
+  julia/qr_race.jl /tmp/qr-rust-new 11 48 rust,rust_control
+```
+
+`QR_WIDTH`、`QR_M`、`QR_N` でガード条件を指定できます（既定8、2048、256）。
+入力が既定寸法の場合は従来の比較と同じ乱数列を使います。
+[判断と失敗した候補を含む計測記録](../docs/worklogs/2026-11-14-qr-julia-rust-race.md)。

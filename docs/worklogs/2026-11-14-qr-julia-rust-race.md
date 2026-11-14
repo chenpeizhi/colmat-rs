@@ -72,7 +72,22 @@ reblocking, serial and ThreadTeams execution. Every timed output is additionally
 checked for reconstruction and orthogonality. The no-prescale path follows the
 Rust owning QR boundary; near-overflow behavior is not established by these tests.
 
-Rust transfer and 10% target remain pending. Rust changes require four-scalar
+The first Rust transfer skips zero-prefix columns in identity-seeded QR/LQ Q
+construction and the owning Qr methods. Generic application is unchanged.
+`20261114-qr-race-rust-prefix-confirm` retains three flanked baseline/candidate
+starts and guard cells: target whole-call ratios 1.010/1.072/0.960, insufficient
+for the target; Q alone fell from about 8.3 to 6.9 ms. Native factor timing also
+varied between processes despite unchanged factor code. The 1T guard fell from
+34.05 to 29.48 ms; 1024×128/8T and 256-square/8T stayed within 1%. Julia still
+leads the candidate at 19.62/19.18/19.59 versus 22.04/22.08/22.03 ms.
+This transfer is a prerequisite experiment, not an 8T improvement claim.
+825 library tests pass (162 ignored), including four-scalar reconstruction,
+orthogonality, old-sequence oracle, row-major output and tail panels. The
+process-wide allocation test passes, including the new 4T/8T thin-Q calls.
+
+The next hypothesis is to avoid projecting a panel against columns that are
+still its identity seeds, as the Julia candidate does. The 10% target remains
+pending. Rust changes require four-scalar
 focused checks, the full library suite and low-level allocation checks before
 timing. This single-L3 shared host cannot satisfy the formal campaign's separate
 observer-cache requirement. 64-core scaling and formal adoption remain unverified.
