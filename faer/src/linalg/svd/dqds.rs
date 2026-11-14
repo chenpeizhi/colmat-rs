@@ -235,14 +235,13 @@ fn block<T: RealField>(
 
         // The current factors are the pivots the last sweep produced (or the input), and the
         // smallest of them bounds the smallest eigenvalue of the shifted block from above.
+        // only whether the smallest pivot is the bottom one is needed, not its index; `fmin`
+        // keeps the scan branchless
         let mut dmin = cur_a[0].clone();
-        let mut dmin_at = 0usize;
-        for i in 1..live {
-            if cur_a[i] < dmin {
-                dmin = cur_a[i].clone();
-                dmin_at = i;
-            }
+        for x in &cur_a[1..live] {
+            dmin = dmin.fmin(x.clone());
         }
+        let dmin_at_bottom = cur_a[live - 1] <= dmin;
 
         // The shift candidate.
         let mut tau = if !have_sweep {
@@ -253,7 +252,7 @@ fn block<T: RealField>(
                 cur_a[live - 2].clone() * cur_b[live - 2].clone(),
                 cur_a[live - 1].clone() + cur_b[live - 2].clone(),
             );
-            if dmin_at + 1 == live {
+            if dmin_at_bottom {
                 // The bottom holds the smallest pivot: the trailing 2x2's smaller eigenvalue is a
                 // close upper bound; back it off by its second-order coupling to the entry above,
                 // weighted by the 2x2 eigenvector's component on that side.
