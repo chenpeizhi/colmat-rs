@@ -337,7 +337,7 @@ fn sweep<T: RealField>(a: &[T], b: &[T], tau: T, a2: &mut [T], b2: &mut [T]) -> 
         let t = a[i + 1].clone() / ahat.clone();
         b2[i] = b[i].clone() * t.clone();
         a2[i] = ahat;
-        delta = delta * t - tau.clone();
+        delta = delta.mul_add_impl(t, -tau.clone());
     }
     if !(delta > zero()) || !delta.is_finite() {
         return Sweep { dmin: delta, all_but_last_positive: true, ok: false };
