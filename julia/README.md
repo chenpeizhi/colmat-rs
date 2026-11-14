@@ -126,5 +126,49 @@ ThreadTeams の使い方は [公式README](https://github.com/vchuravy/ThreadTea
 修復 fixture の非デフレーション数は `k = n - n÷10` です。
 
 CPU2などの同時負荷で計測前後の負荷条件が不成立だったため、実行時間は探索値です。
-同条件の Rust paired 比較と、最終ソルバの Rust 相当実装は未検証です。
+このJulia単独走査では Rust と直接比較していません。直接比較は下の章を参照してください。
+最終ソルバの Rust 相当実装は未検証です。
 このデータから Rust の高速化率や性能限界を確定しません。
+
+## colmat-rs と同一入力で直接比較する
+
+```sh
+# Rust の比較用ライブラリ。colmat の本番コードや公開 C API は変更しない。
+CARGO_TARGET_DIR=target cargo build --release --locked \
+  --manifest-path julia/colmat-bridge/Cargo.toml
+julia --project=julia -e 'using Pkg; Pkg.instantiate()'
+python3 julia/compare_pinned.py /tmp/colmat-vs-julia \
+  --starts 3 --reps 5 --widths 1,4,8,16 --sizes 256,512
+python3 julia/compare_summary.py /tmp/colmat-vs-julia
+```
+
+比較対象は `colmat`、自作 `julia_lab`、標準密行列ソルバ `julia_stdlib` の3種類です。
+colmat はこのチェックアウトの owning API (`self_adjoint_eigen` / `qr` + thin Q /
+`thin_svd`) を private FFI 経由で呼びます。標準 Julia SVD は V を明示的な行列にします。
+同じ Julia 行列を Rust に貸し出すため、入力はバイト単位で同一です。
+入力の SHA256 と、各呼び出しの残差・直交性を保存します。
+バックエンドごとに別プロセスを使い、使用しない Rust/ThreadTeams のワーカーは起動しません。
+起動時の OpenBLAS スレッド数は1とし、標準実装の試行だけ指定幅に設定します。
+
+すべて固有ベクトル／薄い Q と R／薄い U・S・V を求め、作業領域と因子の確保を含めます。
+Rust 結果の検査用コピーと解放、Julia の検査、事前GC、ワーカー初期化は測定外です。
+入力ファイルの読み込み・乱数生成・コンパイルも測定外です。
+Julia `@timed` は Rust のヒープ確保を数えられないため、その欄は `missing` とします。
+
+各予算・バックエンドに新しい Julia プロセスを使い、CPU ID は **1〜予算数** に固定します。
+1T=CPU1、4T=CPU1〜4、8T=CPU1〜8、16T=CPU1〜16です。
+Rust と Julia のチームはプロセス内で再利用します。各試行の前には測定外の20ms待機を置きます。
+同一プロセスでの実装切り替えは、OpenBLAS の待機ワーカーによる順序依存を観測したため
+比較に採用しません。別プロセスの実装順序を回転し、スレッド数の走査順も開始回で反転します。
+各プロセスは計測前に対象実装で入力を検証し、計測した呼び出しも毎回検証します。
+
+集計は各バックエンドのプロセス内中央値を求め、同じ開始回・入力・幅に対応する
+`Julia中央値 / colmat中央値` を作り、3開始回の比の中央値を取ります。
+1より大きければcolmatが速く、小さければそのJulia実装が速い値です。
+負荷確認が不成立のプロセスも削除せず、件数と各プロセスの範囲を残します。
+
+これは実装全体の比較です。アルゴリズム、BLAS、Rust の既定チューニング、
+Julia の規格化処理と GC なども差に含まれ、言語・コンパイラだけの比較ではありません。
+
+[直接比較の結果と制約](../docs/worklogs/2026-11-14-colmat-julia-comparison.md) に、
+分離後の全1,080サンプルと負荷によるばらつきを記録しています。

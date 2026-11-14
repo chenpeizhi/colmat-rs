@@ -10,6 +10,8 @@ upstream `faer`.
   investigate decomposition headroom (#84 and #82). Terminal solvers use Julia
   stdlib; no Rust production path changes or performance adoption are claimed.
   [Algorithm boundaries, verification and local evidence](docs/worklogs/2026-11-14-julia-decomposition-lab.md).
+  [Same-input Rust/Julia comparison](docs/worklogs/2026-11-14-colmat-julia-comparison.md)
+  records separate-process measurements and the rejected mixed-runtime method.
 
 ## Pending EVD experiment
 

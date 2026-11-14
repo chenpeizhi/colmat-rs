@@ -1,0 +1,17 @@
+[package]
+name = "colmat-julia-compare"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+
+[dependencies]
+colmat = { path = "../../faer", default-features = false, features = ["std", "rayon", "threadteam"] }
+threadteam = { version = "0.6.0", default-features = false }
+
+[profile.release]
+debug = 0
