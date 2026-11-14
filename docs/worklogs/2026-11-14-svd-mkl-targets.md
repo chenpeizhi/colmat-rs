@@ -239,12 +239,36 @@ candidate/baseline ratios are:
 
 So the eight-thread target is met and exceeded for `qr_factor` (10.7%/19.8% at 511/513
 for f64, 11.5%/24.3% for c64), but the same width also applies at four participants,
-where it is 1.5-7% slower, and at one it is flat. A change that buys 8T with a 4T
-regression is not adopted as the whole call's recommendation; the commit is reverted by
-`aedbe8f5` and the result is held: the open item is to make the recommendation
-participant-aware (or to fix the internal-cap path, `0f50f4a2`, so the wider H can be
-reduced safely). Neither was attempted, and the four-participant row needs a plan of its
-own.
+where it is 1.5-7% slower, and at one it is flat. That global recommendation is not the
+adopted form; it is reverted by `aedbe8f5` and kept as the measurement that motivates the
+participant-aware API below.
+
+### Participant-aware recommendation (`9cced7f4`)
+
+The width is the caller's, so the participant count belongs in the recommendation the
+caller uses. `recommended_block_size_with_degree` returns 16 for a square of at most 640
+rows at eight or more participants and the shape-alone width otherwise. The fbench
+caller passes its declared budget (`fbench` commit `2fc0fa2`); the upstream arm keeps the
+shape-alone width, so the pair has the same control structure as the SVD runs.
+
+Paired Docker+MKL `qr_factor` run: control baseline `20261114T131848Z` (the API with the
+shape-only policy, `cec72348`) against candidate `20261114T132518Z` (9cced7f4), same
+harness `2fc0fa2`, 511/512/513, f64/c64, C/F, 1/4/8T. The MKL control is median 0.9932
+(the run's overall level; the 1T/4T rows below are read against it):
+
+| dtype | shape | 1T | 4T | 8T |
+| --- | --- | ---: | ---: | ---: |
+| f64 | 511 | 0.999 | 0.996 | **0.900** |
+| f64 | 512 | 0.995 | 0.995 | **0.904** |
+| f64 | 513 | 0.995 | 0.999 | **0.806** |
+| c64 | 511 | 0.999 | 0.997 | **0.881** |
+| c64 | 512 | 0.993 | 0.995 | **0.872** |
+| c64 | 513 | 0.996 | 0.995 | **0.761** |
+
+One and four participants are unchanged (0.993-0.999, inside the run's level and the
+MKL control), and eight participants is 10.0%/19.4% ahead for f64 and 11.9%/24.0% for
+c64 at 511/513. This is the adopted QR form: the 8T target is met without the 4T
+regression of the global recommendation.
 
 ### c64 at one thread
 
@@ -268,12 +292,12 @@ complex arithmetic, not in the serial stages this work removed.
   products and apply, which are at their flop/bandwidth limits for this layout;
   a two-GEMM complex apply lost. The 4T/8T rows are at 15%, so the family's
   average is past 10%.
-- QR at 511/513 is **held, not adopted**. The eight-thread win is real
-  (`qr_factor`: 10.7%/19.8% f64 and 11.5%/24.3% c64 at 511/513; `qr` 2.9%/8.3%
-  locally), but the caller-side 16-wide `H` is 1.5-7% slower at four participants
-  and flat at one, and the internal variant failed the timed grid's residual
-  check. The open item is a participant-aware recommendation or a correct
-  internal reduction, plus a plan for the four-participant row. So the QR 10%
-  target is met at 8T only.
+- QR at 511/513 is **adopted at eight participants only**. The participant-aware
+  recommendation (`9cced7f4`) leaves 1T/4T at the shape-alone width, so those
+  rows do not move, and it is 10.0%/19.4% ahead for f64 `qr_factor` at 8T
+  (11.9%/24.0% for c64). The global recommendation that would also move 4T
+  regresses it by 1.5-7% and is not adopted; the internal cap is invalid by
+  contract (the caller's compact-factor layout). The QR 10% target is therefore
+  met at 8T only.
 - The host cannot establish formal adoption (boost on, shared L3, no 64-core
   scaling). A campaign pair remains for whoever moves the pin.
