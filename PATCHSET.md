@@ -13,6 +13,14 @@ upstream `faer`.
   [Same-input Rust/Julia comparison](docs/worklogs/2026-11-14-colmat-julia-comparison.md)
   records separate-process measurements and the rejected mixed-runtime method.
 
+## Pending QR competition
+
+- **EXPERIMENT**: colmat-style Julia QR probes with independent factor/Q panel
+  widths and identity-seeded Q construction; three isolated starts beat the
+  original Rust by at least 1.05× at 2048×256 f64, 8T. Rust transfer pending;
+  this is local headroom evidence for #84, not adoption.
+  [Decisions, rejected candidates and evidence](docs/worklogs/2026-11-14-qr-julia-rust-race.md).
+
 ## Pending EVD experiment
 
 - **EXPERIMENT**: independent divide-and-conquer EVD weight and eigenvector

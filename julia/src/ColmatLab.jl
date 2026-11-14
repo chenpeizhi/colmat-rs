@@ -7,7 +7,7 @@ See ../README.md for the explicit LAPACK terminal-solver boundary.
 module ColmatLab
 using LinearAlgebra
 using ThreadTeams
-export Serial, Team, qr_lab, eigh_lab, svd_lab, qr_factor!, tridiagonalize!,
+export Serial, Team, qr_lab, qr_colmat_lab, eigh_lab, svd_lab, qr_factor!, tridiagonalize!,
        bidiagonalize!, QRWorkspace, BidiagWorkspace, TridiagWorkspace,
        repair_weights!, repair_vectors!, repair_fixture
 
@@ -102,6 +102,7 @@ function normalized(A::AbstractMatrix{Float64})
 end
 include("qr.jl")
 include("basis.jl")
+include("qr_colmat.jl")
 include("eigh.jl")
 include("svd.jl")
 include("repair.jl")
