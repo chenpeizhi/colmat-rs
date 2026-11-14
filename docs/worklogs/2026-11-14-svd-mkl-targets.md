@@ -176,7 +176,7 @@ The f64 values-only case is now 11.6-11.8% faster at one thread, 22% at four and
 eight. Complex is 7.8-8.1% at one thread and 15% at four and eight: its bidiagonalisation
 is twice the element work, so the serial stages these changes remove are a smaller share
 of its total and the two memory-bound complex products dominate it.
-## QR at 511/513 (`0f50f4a2`, reverted by `71a9e84f`)
+## QR at 511/513 (internal cap `0f50f4a2`, caller-side width `1b36f3f7`, both reverted)
 
 The QR factorization was not part of the first pair. A width scan on the local host
 (`qr_in_place` at 511/513, the campaign's `qr_factor` call) found that the shipped
@@ -220,10 +220,42 @@ therefore changes the block width underneath a caller-provided `H` whose layout 
 look-ahead/staged-panel path assumes, and that path is not correct at the smaller width.
 The commit is reverted by `71a9e84f`; the tree is the SVD tip again.
 
-The QR 10% target is therefore **not met**: `qr_factor` at 8T would have been 9.4%/17.5%
-(and `qr` 2.9%/8.3%), but the change is not shippable as written; 1T/4T are unchanged
-because the caller's `H` width is the lever there and the routine cannot exceed it
-without a scratch-contract change.
+### Caller-side width (`1b36f3f7`, reverted by `aedbe8f5`)
+
+The safe route is to make the caller pass a 16-wide `H`: `recommended_block_size` returns
+16 for a square of 129..640 columns. That path is numerically correct. The Docker+MKL
+paired `qr_factor` run (baseline `20261114T124251Z`, a395150c; candidate
+`20261114T125936Z`, 1b36f3f7) completes with the MKL control at 0.9996, and its
+candidate/baseline ratios are:
+
+| dtype | shape | 1T | 4T | 8T |
+| --- | --- | ---: | ---: | ---: |
+| f64 | 511 | 1.002 | 1.037 | **0.893** |
+| f64 | 512 | 0.986 | 1.038 | **0.908** |
+| f64 | 513 | 0.973 | 1.070 | **0.802** |
+| c64 | 511 | 0.996 | 1.015 | **0.885** |
+| c64 | 512 | 0.994 | 1.009 | **0.870** |
+| c64 | 513 | 0.980 | 1.022 | **0.757** |
+
+So the eight-thread target is met and exceeded for `qr_factor` (10.7%/19.8% at 511/513
+for f64, 11.5%/24.3% for c64), but the same width also applies at four participants,
+where it is 1.5-7% slower, and at one it is flat. A change that buys 8T with a 4T
+regression is not adopted as the whole call's recommendation; the commit is reverted by
+`aedbe8f5` and the result is held: the open item is to make the recommendation
+participant-aware (or to fix the internal-cap path, `0f50f4a2`, so the wider H can be
+reduced safely). Neither was attempted, and the four-participant row needs a plan of its
+own.
+
+### c64 at one thread
+
+An instrumented values call (511x511 c64, 1T, last samples of the warm run) splits as:
+total 36.75 ms, bidiagonalisation 34.3 (Y product 12.2, X product 11.2, trailing update
+9.17, row 0.65, column 0.49, tail 0.58), dqds 2.14, copy 0.12. The complex apply is 3.8x
+the f64 apply for 4x its flops, i.e. it runs at the same flop rate, and the two complex
+products are 2.7x the f64 ones for 2x the bytes. A two-`k = 16` complex apply was tried
+and was slower (9.92 against 9.17 ms). The complex one-thread result is therefore
+recorded as an **explicit unmet target**: 7.8-8.1%, with the remaining 2.2-2.4 points in
+complex arithmetic, not in the serial stages this work removed.
 
 ## What remains unverified
 
@@ -231,11 +263,17 @@ without a scratch-contract change.
   1T, 22% at 4T, 19% at 8T). Complex is 7.8-8.1% at 1T and 15% at 4T/8T; the
   one-thread complex gap is its bidiagonalisation, which is twice the element
   work of the real one and whose two memory-bound products are untouched.
-- QR at 511/513 is unchanged. The 16-column lead at 8T is real in the timing
-  (9.4%/17.5% for `qr_factor`, 2.9%/8.3% for `qr`) but the internal cap failed
-  the timed grid's residual check for f64 and c64 at 511/512/513, and was
-  reverted. A caller-side width change (a different `recommended_block_size`
-  plus a scratch-contract change) would need its own paired run and a plan for
-  the four-participant row, where the wider block wins.
+- c64 values-only at one thread is an **explicit unmet target**: 7.8-8.1%
+  (0.922/0.919). The stage split above puts the remaining gap in the complex
+  products and apply, which are at their flop/bandwidth limits for this layout;
+  a two-GEMM complex apply lost. The 4T/8T rows are at 15%, so the family's
+  average is past 10%.
+- QR at 511/513 is **held, not adopted**. The eight-thread win is real
+  (`qr_factor`: 10.7%/19.8% f64 and 11.5%/24.3% c64 at 511/513; `qr` 2.9%/8.3%
+  locally), but the caller-side 16-wide `H` is 1.5-7% slower at four participants
+  and flat at one, and the internal variant failed the timed grid's residual
+  check. The open item is a participant-aware recommendation or a correct
+  internal reduction, plus a plan for the four-participant row. So the QR 10%
+  target is met at 8T only.
 - The host cannot establish formal adoption (boost on, shared L3, no 64-core
   scaling). A campaign pair remains for whoever moves the pin.
