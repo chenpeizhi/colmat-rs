@@ -281,6 +281,14 @@ and was slower (9.92 against 9.17 ms). The complex one-thread result is therefor
 recorded as an **explicit unmet target**: 7.8-8.1%, with the remaining 2.2-2.4 points in
 complex arithmetic, not in the serial stages this work removed.
 
+## Scope decision (2026-11-14)
+
+The user accepted the current scope after the paired evidence: f64 `svd_values` at
+10%+ for 511/513 at 1T/4T/8T, QR `qr_factor` at 10%+ for 8T with 1T/4T unchanged by the
+participant-aware recommendation, and c64 `svd_values` at 1T 7.8-8.1% recorded as an
+explicit unmet target (4T/8T are at 15%). Closing c64 1T would need a dqds algorithm
+change or a complex-kernel campaign, which is outside this layout change.
+
 ## What remains unverified
 
 - The f64 values-only 10% target is met at every thread count (11.6-11.8% at
