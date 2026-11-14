@@ -3,6 +3,14 @@
 The ledger of the experiments this fork runs. It records the diff against
 upstream `faer`.
 
+## Pending Julia laboratory
+
+- **EXPERIMENT**: `julia/` provides Float64 Householder QR, tridiagonal and
+  blocked bidiagonal reduction, repair kernels, and ThreadTeams execution to
+  investigate decomposition headroom (#84 and #82). Terminal solvers use Julia
+  stdlib; no Rust production path changes or performance adoption are claimed.
+  [Algorithm boundaries, verification and local evidence](docs/worklogs/2026-11-14-julia-decomposition-lab.md).
+
 ## Pending EVD experiment
 
 - **EXPERIMENT**: independent divide-and-conquer EVD weight and eigenvector
