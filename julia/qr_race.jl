@@ -1,6 +1,7 @@
 # Run each runtime in a separate process; shared variants use BLAS parallelism.
 include("compare_common.jl")
 using Statistics
+const QR_RUST_LEAF=parse(Int,get(ENV,"QR_RUST_LEAF","1"))
 const QR_RACE_WIDTH=parse(Int,get(ENV,"QR_WIDTH","8"))
 const QR_RACE_M=parse(Int,get(ENV,"QR_M","2048"))
 const QR_RACE_N=parse(Int,get(ENV,"QR_N","256"))
@@ -15,6 +16,14 @@ function target_input()
     randn(rng,256,256);randn(rng,1024,128);randn(rng,512,512)
     randn(rng,2048,256)
 end
+invoke_race(::Val{:leaf1},team,A,ex,block)=rust_call(team,A,UInt32(101))
+invoke_race(::Val{:leaf4},team,A,ex,block)=rust_call(team,A,UInt32(104))
+invoke_race(::Val{:leaf8},team,A,ex,block)=rust_call(team,A,UInt32(108))
+invoke_race(::Val{:leaf12},team,A,ex,block)=rust_call(team,A,UInt32(112))
+invoke_race(::Val{:leaf16},team,A,ex,block)=rust_call(team,A,UInt32(116))
+invoke_race(::Val{:leaf24},team,A,ex,block)=rust_call(team,A,UInt32(124))
+invoke_race(::Val{:leaf48},team,A,ex,block)=rust_call(team,A,UInt32(148))
+invoke_race(::Val{:rust_leaf},team,A,ex,b)=rust_call(team,A,UInt32(100+QR_RUST_LEAF))
 invoke_race(::Val{:rust_original},team,A,ex,b)=rust_call(team,A,UInt32(3))
 invoke_race(::Val{:rust},team,A,ex,b)=rust_call(team,A,UInt32(1))
 invoke_race(::Val{:rust_control},team,A,ex,b)=rust_call(team,A,UInt32(1))
@@ -30,6 +39,11 @@ function trial(mode,team,A,ex,b)
     if t.value isa Ptr{Cvoid}
         try
             check(A,rust_outputs(t.value,A,Val(:qr)),Val(:qr))
+            if mode isa Val{:rust_leaf} || startswith(string(typeof(mode).parameters[1]),"leaf")
+                stages=zeros(2)
+                ccall((:compare_copy,RUST_LIB),Cvoid,(Ptr{Cvoid},UInt32,Ptr{Float64}),t.value,UInt32(0),stages)
+                return t.time,stages[1],stages[2]
+            end
         finally
             result_free(t.value)
         end
@@ -44,7 +58,7 @@ function run_race(outdir,reps,block,modes)
     mkpath(outdir);BLAS.set_num_threads(any(m->m in (:shared,:structured_shared),modes) ? QR_RACE_WIDTH : 1)
     A=target_input();inputhash=bytes2hex(sha256(reinterpret(UInt8,vec(A))))
     ex=Team(QR_RACE_WIDTH;minwork=parse(Int,get(ENV,"QR_MINWORK","0")))
-    native=any(m->m in (:rust,:rust_control,:rust_original),modes)
+    native=any(m->m in (:rust,:rust_control,:rust_original,:rust_leaf) || startswith(string(m),"leaf"),modes)
     team=native ? team_new(QR_RACE_WIDTH) : C_NULL
     native && team==C_NULL && error("Rust team")
     try
@@ -73,7 +87,7 @@ function run_race(outdir,reps,block,modes)
         open(joinpath(outdir,"metadata.txt"),"w") do io
             println(io,"Target $(size(A)), thin Q/R,$QR_RACE_WIDTH threads, BLAS=",BLAS.get_num_threads(),", Julia=",VERSION)
             println(io,"Rust binary=",RUST_LIB,"; input_sha256=",inputhash)
-            println(io,"modes=$modes; block=$block; reps=$reps; grain=$QR_RACE_GRAIN; leaf=$QR_RACE_LEAF; basisblock=$QR_RACE_BASISBLOCK; pad=$QR_RACE_PAD; prescale=$QR_RACE_PRESCALE; owning-call allocations included")
+            println(io,"modes=$modes; block=$block; reps=$reps; grain=$QR_RACE_GRAIN; leaf=$QR_RACE_LEAF; rust_leaf=$QR_RUST_LEAF; basisblock=$QR_RACE_BASISBLOCK; pad=$QR_RACE_PAD; prescale=$QR_RACE_PRESCALE; owning-call allocations included")
             print(io,read("/proc/self/status",String))
         end
     finally

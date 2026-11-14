@@ -1334,6 +1334,14 @@ impl<T: ComplexField> Qr<T> {
 		let block_size =
 			linalg::qr::no_pivoting::factor::recommended_block_size::<T>(m, n);
 		let mut Q_coeff = Mat::zeros(block_size, size);
+		// 2048x256 f64, 8T leaf scan (factor ms, three-start medians):
+		// 1/4/8/12/16/24/48 -> 12.34/12.34/11.96/11.59/11.60/12.24/16.37.
+		// 12 is the smallest width on the best plateau. The low-level default
+		// stays unchanged; see the QR Julia/Rust worklog (2026-11-14).
+		let params = Spec::new(linalg::qr::no_pivoting::factor::QrParams {
+			recursion_leaf_size: 12,
+			..<linalg::qr::no_pivoting::factor::QrParams as Auto<T>>::auto()
+		});
 		linalg::qr::no_pivoting::factor::qr_in_place(
 			QR.as_mut(),
 			Q_coeff.as_mut(),
@@ -1344,10 +1352,10 @@ impl<T: ComplexField> Qr<T> {
 					n,
 					block_size,
 					par_shape,
-					default(),
+					params,
 				),
 			)),
-			default(),
+			params,
 		);
 		let (Q_basis, R) = split_LU(QR);
 		Self {
@@ -3369,15 +3377,15 @@ mod tests {
 	#[test]
 	fn test_svd_solver_for_rectangular_matrix() {
 		#[rustfmt::skip]
-        let A = crate::mat![
-            [4., 5., 7.], [8., 8., 2.], [4., 0., 9.], [2., 6., 2.], [0., 6., 0.],
-        ];
+		let A = crate::mat![
+			[4., 5., 7.], [8., 8., 2.], [4., 0., 9.], [2., 6., 2.], [0., 6., 0.],
+		];
 		#[rustfmt::skip]
-        let B = crate::mat![
-            [105., 49.], [98., 54.], [113., 35.], [46., 34.], [12., 24.],
-        ];
+		let B = crate::mat![
+			[105., 49.], [98., 54.], [113., 35.], [46., 34.], [12., 24.],
+		];
 		#[rustfmt::skip]
-        let X_true = crate::mat![[8., 2.], [2., 4.], [9., 3.],];
+		let X_true = crate::mat![[8., 2.], [2., 4.], [9., 3.],];
 		let approx_eq = CwiseMat(ApproxEq::eps() * 128.0 * (A.nrows() as f64));
 		let svd = A.svd(Par::Seq).unwrap();
 		let mut X = B.cloned();

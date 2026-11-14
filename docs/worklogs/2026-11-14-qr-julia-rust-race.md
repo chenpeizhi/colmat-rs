@@ -109,3 +109,26 @@ Next probe: expose the recursive panel's leaf width as an explicit parameter
 same input/team, and only then consider the owning tall-QR choice. This
 transfers Julia's measured small serial panels without changing generic Q
 application or hard-capping a parallel region.
+
+
+`20261114-qr-race-rust-leaf-scan` tests root block 48 with leaf widths
+1/4/8/12/16/24/48 on the same binary and team. Median factor times across
+three starts (ms) are 12.342/12.344/11.963/11.589/11.596/12.242/16.369.
+A duplicate leaf-1 label agrees within 0.3%. Select 12 as the smallest width on
+the best plateau; 48 is rejected. This RawQr probe includes explicit R copying
+and differs from owning Qr; only its stage comparison selects the parameter.
+
+`QrParams::recursion_leaf_size` defaults to 1, preserving low-level QR, LQ and
+SVD choices. The owning Qr constructor explicitly tries 12. This changes panel
+grouping, not the available thread count; trailing products retain their full
+cost-selected budget. Larger leaves add serial O(m*n*leaf) work, so many-core
+scaling remains a necessary unverified acceptance condition.
+
+The owning-call pilot `20261114-qr-race-rust-leaf12-pilot` gives baseline flanks
+23.019/22.760 ms, candidate 21.285 ms (ratio 0.930), Julia 19.311 ms. The
+10% target is still unmet; this is a pilot, not three-start acceptance. The
+826-test library suite passes (162 ignored), with four-scalar leaf sweeps on
+a held team of four; earlier serial sweeps also passed. Factor and Q regions
+allocate zero at 4T/8T with preallocated output/scratch. The next hypothesis
+transfers Julia's independently sized factor/Q panels, including coefficient
+regrouping in the owning-call cost.

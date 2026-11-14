@@ -11,6 +11,7 @@ struct TeamState {
 enum Output {
 	Eigh(SelfAdjointEigen<f64>),
 	Qr { factor: Qr<f64>, q: Mat<f64> },
+    RawQr { _packed: Mat<f64>, _coeff: Mat<f64>, q: Mat<f64>, r: Mat<f64>, times: [f64;2] },
 	Svd(Svd<f64>),
 }
 
@@ -77,6 +78,24 @@ pub unsafe extern "C" fn compare_run(
 				Output::Qr { factor, q }
 			},
 			2 => Output::Svd(a.thin_svd(par).expect("SVD")),
+            100..=164 => {
+                use colmat::dyn_stack::{MemBuffer,MemStack};
+                use colmat::linalg::qr::no_pivoting::{factor,unitary};
+                let k=m.min(n);let b=48.min(k).max(1);
+                let mut packed=a.to_owned();let mut h=Mat::zeros(b,k);
+                let params=colmat::Spec::new(factor::QrParams { recursion_leaf_size:(kind-100) as usize, ..<factor::QrParams as colmat::Auto<f64>>::auto() });
+                let mut mem=MemBuffer::new(factor::qr_in_place_scratch::<f64>(m,n,b,par.shape(),params));
+                let t=std::time::Instant::now();
+                factor::qr_in_place(packed.as_mut(),h.as_mut(),par.reborrow(),MemStack::new(&mut mem),params);
+                let tf=t.elapsed().as_secs_f64();
+                let mut q=Mat::zeros(m,k);
+                let mut mem=MemBuffer::new(unitary::unitary_scratch::<f64>(m,n,k,b,par.shape()));
+                let t=std::time::Instant::now();
+                unitary::unitary(q.as_mut(),packed.as_ref(),h.as_ref(),false,par.reborrow(),MemStack::new(&mut mem));
+                let tq=t.elapsed().as_secs_f64();
+                let mut r=Mat::zeros(k,n);factor::copy_r(r.as_mut(),packed.as_ref(),false);
+                Output::RawQr{_packed:packed,_coeff:h,q,r,times:[tf,tq]}
+            },
 			_ => panic!("unknown decomposition"),
 		};
 		let result = if let Some(team) = &state.team {
@@ -131,6 +150,12 @@ pub unsafe extern "C" fn compare_copy(
 				}
 			}
 		},
+        (Output::RawQr { q,.. },1)=>write_mat(q.as_ref()),
+        (Output::RawQr { r,.. },2)=>write_mat(r.as_ref()),
+        (Output::RawQr { times,.. },0)=> {
+            // SAFETY: the private leaf probe supplies a writable two-element timing array.
+            for i in 0..2 { unsafe { *dst.add(i)=times[i]; } }
+        },
 		(Output::Eigh(f), 1) => write_mat(f.U()),
 		(Output::Qr { q, .. }, 1) => write_mat(q.as_ref()),
 		(Output::Qr { factor, .. }, 2) => write_mat(factor.thin_R()),
