@@ -146,14 +146,14 @@ impl<T: ComplexField> Auto<T> for QrParams {
 		}
 	}
 }
-/// Blocking recursion nodes entered on the calling thread, for the tests that
-/// check the leaf width reached the recursion.
-///
-/// The leaf width only changes how deep the blocking recursion goes, and a
-/// factorization that ignored it still reconstructs, so the reconstruction checks
-/// cannot tell an engaged leaf from a no-op. A test that runs the recursion
-/// sequentially reads this count and asserts that a wider leaf enters fewer
-/// nodes. It is per thread because the test harness runs tests concurrently.
+// Blocking recursion nodes entered on the calling thread, for the tests that
+// check the leaf width reached the recursion.
+//
+// The leaf width only changes how deep the blocking recursion goes, and a
+// factorization that ignored it still reconstructs, so the reconstruction checks
+// cannot tell an engaged leaf from a no-op. A test that runs the recursion
+// sequentially reads this count and asserts that a wider leaf enters fewer
+// nodes. It is per thread because the test harness runs tests concurrently.
 #[cfg(test)]
 std::thread_local! {
 	static RECURSION_NODES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
@@ -531,6 +531,7 @@ fn factor_panel<T: ComplexField>(
 /// is `gelqf`'s block of `block_size` rows, staged so that each of them is contiguous. Only the
 /// panel is copied, twice per block; the trailing update stays a matrix product on the caller's
 /// matrix, in place.
+#[allow(clippy::too_many_arguments)] // faer kernel shape, kept flat to match upstream
 fn factor_panel_staged<T: ComplexField>(
 	A: MatMut<'_, T>,
 	work: MatMut<'_, T>,
