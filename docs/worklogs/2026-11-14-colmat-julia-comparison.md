@@ -51,7 +51,8 @@ the evidence rather than being treated as accepted speedups.
 
 This compares implementations, including algorithms and BLAS. Julia1.13.3's
 standard symmetric eigen solver defaults to RobustRepresentations/syevr (MRRR);
-colmat uses D&C. The lab's explicit boundaries remain in julia/README.md.
+colmat uses D&C. The lab's explicit boundaries remain in its README (that tree
+has since been removed; see [the laboratory record](2026-11-14-julia-decomposition-lab.md)).
 The serial EVD gap is a lead for investigation, not proof of a compiler limit.
 
 Local evidence in the sibling colmat-benchmark checkout:

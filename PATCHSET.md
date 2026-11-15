@@ -3,12 +3,16 @@
 The ledger of the experiments this fork runs. It records the diff against
 upstream `faer`.
 
-## Pending Julia laboratory
+## Dropped Julia laboratory (2026-11-15)
 
-- **EXPERIMENT**: `julia/` provides Float64 Householder QR, tridiagonal and
-  blocked bidiagonal reduction, repair kernels, and ThreadTeams execution to
-  investigate decomposition headroom (#84 and #82). Terminal solvers use Julia
-  stdlib; performance adoption remains pending.
+- **DROPPED**: `julia/` held Float64 Householder QR, tridiagonal and blocked
+  bidiagonal reduction, repair kernels and ThreadTeams execution as a reference
+  challenger for decomposition headroom (#84 and #82). Nothing in the workspace
+  built or depended on it and the fork ships no Julia path, so it was
+  experimental scaffolding rather than carried code. Removed from the tree; the
+  source remains in history (`bfee09e5`) and on the local branch
+  `experiment/julia-headroom`. Its terminal solvers were Julia stdlib, so the
+  timings never bounded the Rust components.
   [Algorithm boundaries, verification and local evidence](docs/worklogs/2026-11-14-julia-decomposition-lab.md).
   [Same-input Rust/Julia comparison](docs/worklogs/2026-11-14-colmat-julia-comparison.md)
   records separate-process measurements and the rejected mixed-runtime method.
@@ -20,7 +24,8 @@ upstream `faer`.
   policies and the low-level default are preserved. Identity-seeded Q skips
   known-zero columns (also the shared LQ seeding path). At 2048×256 f64/8T,
   three frozen-binary cohorts shorten the complete thin-Q/R call by
-  36.6%/17.0%/36.4%; all beat the Julia challenger. 827 library tests, held-team
+  36.6%/17.0%/36.4%; all beat the Julia challenger, whose `julia/` harness has
+  since been removed. 827 library tests, held-team
   factor/Q allocation checks and no_std check pass. Shared-host scan only;
   broad campaign, four-dtype performance and 64-core adoption remain pending.
   [Decisions, rejected candidates and evidence](docs/worklogs/2026-11-14-qr-julia-rust-race.md).

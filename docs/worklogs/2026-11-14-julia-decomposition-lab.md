@@ -32,6 +32,10 @@
   contracts. The scripts live here because the user explicitly requested the
   Julia experiment under `./julia`; the normal Rust campaign stays in the
   sibling colmat-benchmark repository.
+- The `./julia` tree was removed from the fork on 2026-11-15 (`PATCHSET.md`
+  records the drop). It was reference scaffolding with no workspace dependency
+  and the fork ships no Julia path; the source stays in history (`bfee09e5`)
+  and on `experiment/julia-headroom`.
 
 ## Verification conclusions and constraints
 
