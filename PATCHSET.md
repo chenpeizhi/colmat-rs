@@ -21,11 +21,14 @@ upstream `faer`.
 
 - **EXPERIMENT**: Julia/Rust QR competition for #84. Owning Qr uses block16,
   leaf8 at n≤256 and m≥2n when the recommended block exceeds16; other factor
-  policies and the low-level default are preserved. Identity-seeded Q skips
+  policies and the low-level default are preserved. The block16/leaf8 slice and
+  the participant-aware block width are on main (#196, #198); this branch keeps
+  the recursion leaf a crate-private argument of the factor entry, so `QrParams`
+  carries no field for it. Identity-seeded Q skips
   known-zero columns (also the shared LQ seeding path). At 2048×256 f64/8T,
   three frozen-binary cohorts shorten the complete thin-Q/R call by
   36.6%/17.0%/36.4%; all beat the Julia challenger, whose `julia/` harness has
-  since been removed. 827 library tests, held-team
+  since been removed. 835 library tests, held-team
   factor/Q allocation checks and no_std check pass. Shared-host scan only;
   broad campaign, four-dtype performance and 64-core adoption remain pending.
   [Decisions, rejected candidates and evidence](docs/worklogs/2026-11-14-qr-julia-rust-race.md).
@@ -36,7 +39,9 @@ upstream `faer`.
   column repairs run on the caller-owned team ([#84](https://github.com/tensor4all/colmat-rs/issues/84)).
   Tridiagonal reduction is unchanged. Local f64 512/8T paired reference scan:
   whole-call ratio 0.7502; host-only estimates, campaign and 64-core validation
-  still pending. [Isolation, evidence and limits](docs/worklogs/2026-11-14-eigh-parallel-repair.md).
+  still pending. A post-merge paired scan against main `173959f2` kept the ratio
+  at 0.72-0.75, so merging main did not remove the split.
+  [Isolation, evidence and limits](docs/worklogs/2026-11-14-eigh-parallel-repair.md).
 
 ## Pending public API extension
 

@@ -154,3 +154,15 @@ comparison above establishes the local target.
   1024×256 and 4096×256 (raw total reductions about 12/16/3/15% against the
   original factor policy under the same Q constructor). Square and 512-column
   probes do not broaden the final policy; their full results remain recorded.
+
+## Post-merge check
+
+The block16/leaf8 slice and the participant-aware block width landed on main
+without this branch (#196, #198), so the merge keeps main's policy and re-applies
+only the leaf internalization. One paired scan on this workstation (36 logical
+cores, shared, load average about 8.8; CPUs 0-7; 11 repetitions per process after
+3 warm-ups, interleaved main/branch, medians): complete owning Qr at 2048×256
+f64, 8T, 18.08/18.11/18.29 ms on main against 17.98/18.14/18.19 ms on the merge;
+at 1T, 34.17/35.05/35.45 against 33.74/33.95/34.95. No regression at either
+width. This is a scan, not the campaign arm. The library suite at the merge is
+835 passed, 162 ignored.

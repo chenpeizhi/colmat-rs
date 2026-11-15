@@ -96,3 +96,13 @@ Final branch verification (release, locked):
   Log `/tmp/eigh-parallel-repair-alloc-solver.log`.
 - `git diff --check`: passed. No formal performance acceptance is claimed
   for this cleaned branch; the earlier timing numbers are the isolated probe's.
+
+## Post-merge check
+
+Main at `173959f2` does not carry this split. After merging it into the branch,
+one paired scan on this workstation (36 logical cores, shared, load average about
+8.8; CPUs 0-7; 11 repetitions per process after 2 warm-ups, interleaved
+main/branch, medians) put the complete 512/8T tridiagonal EVD with eigenvectors
+at 11.72/12.24/12.75 ms on main against 8.79/9.09/9.12 ms on the merge, ratio
+0.72-0.75, consistent with the 0.7502 recorded above. This is a scan, not the
+adoption arm; it establishes that the merge kept the split and its cost model.
