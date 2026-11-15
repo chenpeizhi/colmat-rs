@@ -2,8 +2,8 @@ use crate::assert;
 use crate::internal_prelude::*;
 use alloc::vec;
 use alloc::vec::Vec;
-use dyn_stack::MemBuffer;
 use colmat_traits::ComplexConj;
+use dyn_stack::MemBuffer;
 pub use linalg::cholesky::ldlt::factor::LdltError;
 pub use linalg::cholesky::llt::factor::LltError;
 pub use linalg::evd::EvdError;
@@ -619,6 +619,7 @@ impl<
 		imp(self.rb().canonical(), par)
 	}
 }
+#[allow(clippy::type_complexity)] // faer signature shape, kept explicit to match upstream
 /// factors $B = L L^H$ and returns $(L, L^{-1} A L^{-H})$
 #[track_caller]
 fn self_adjoint_gevd_reduce<C: Conjugate>(
@@ -1189,9 +1190,15 @@ impl<T: ComplexField> PartialPivLu<T> {
 	#[track_caller]
 	pub fn new<C: Conjugate<Canonical = T>>(
 		A: MatRef<'_, C>,
-		par: Par<'_>,
+		mut par: Par<'_>,
 	) -> Self {
-		let LU = A.to_owned();
+		// the copy and the split in `new_imp` run on `par` (#191): at 1024 on 8 threads they were
+		// longer than the factorization while they ran on the caller
+		let LU = if const { C::IS_CANONICAL } {
+			linalg::owned_copy(A.canonical(), par.reborrow())
+		} else {
+			A.to_owned()
+		};
 		Self::new_imp(LU, par)
 	}
 
@@ -1214,7 +1221,7 @@ impl<T: ComplexField> PartialPivLu<T> {
 			)),
 			default(),
 		);
-		let (L, U) = split_LU(LU);
+		let (L, U) = linalg::split_lu_owned(LU, par);
 		Self {
 			L,
 			U,
@@ -1331,30 +1338,30 @@ impl<T: ComplexField> Qr<T> {
 		let par_shape = par.shape();
 		let (m, n) = QR.shape();
 		let size = Ord::min(m, n);
-		let recommended = linalg::qr::no_pivoting::factor::recommended_block_size::<T>(m, n);
+		let recommended =
+			linalg::qr::no_pivoting::factor::recommended_block_size::<T>(m, n);
 		// Small tall QR scan, 2048x256 f64 at 8T (factor/Q ms):
 		// block/leaf 16/8: 7.97/5.20, 32/8: 9.36/4.72, 48/12: 11.59/4.92.
 		// Regrouping 16-column factors into Q blocks32/64 cost more than it saved.
 		// Limit this experiment to n<=256 and aspect>=2, checked at n=128/256
 		// and m=512..4096; other shapes retain their original factor policy.
-		// Decisions and complete scan: QR Julia/Rust worklog (2026-11-14).
-		let small_tall = n <= 256 && m >= n.saturating_mul(2) && recommended > 16;
+		// Scans and frozen-binary comparison: tensor4all/colmat-rs#195.
+		let small_tall =
+			n <= 256 && m >= n.saturating_mul(2) && recommended > 16;
 		let block_size = if small_tall { 16 } else { recommended };
 		let mut Q_coeff = Mat::zeros(block_size, size);
-		let params = Spec::new(<linalg::qr::no_pivoting::factor::QrParams as Auto<T>>::auto());
-		// The leaf is internal: `qr_in_place_with_leaf` is the crate-private entry
-		// that carries the experiment's narrower unblocked panel to the recursion.
+		let params =
+			Spec::new(<linalg::qr::no_pivoting::factor::QrParams as Auto<T>>::auto());
+		// The leaf is internal: `qr_in_place_with_leaf` is the crate-private
+		// entry that carries the experiment's narrower unblocked panel to the
+		// recursion.
 		linalg::qr::no_pivoting::factor::qr_in_place_with_leaf(
 			QR.as_mut(),
 			Q_coeff.as_mut(),
 			par.reborrow(),
 			MemStack::new(&mut MemBuffer::new(
 				linalg::qr::no_pivoting::factor::qr_in_place_scratch::<T>(
-					m,
-					n,
-					block_size,
-					par_shape,
-					params,
+					m, n, block_size, par_shape, params,
 				),
 			)),
 			params,
@@ -3222,7 +3229,11 @@ mod tests {
 	#[cfg(feature = "threadteam")]
 	#[test]
 	fn test_small_tall_qr_four_scalars() {
-		fn case<T: ComplexField>(make: fn(f64, f64) -> T, mag: fn(&T) -> f64, eps: f64) {
+		fn case<T: ComplexField>(
+			make: fn(f64, f64) -> T,
+			mag: fn(&T) -> f64,
+			eps: f64,
+		) {
 			crate::team::with_team(4, |mut par| {
 				for (m, n, block) in [
 					(512, 128, 16),
@@ -3253,14 +3264,18 @@ mod tests {
 						let diff = &q * f.thin_R() - &a;
 						for j in 0..n {
 							for i in 0..m {
-								assert!(mag(&diff[(i, j)]) <= eps * (m + n) as f64);
+								assert!(
+									mag(&diff[(i, j)]) <= eps * (m + n) as f64
+								);
 							}
 						}
 						let k = m.min(n);
 						let orth = q.adjoint() * &q - Mat::<T>::identity(k, k);
 						for j in 0..k {
 							for i in 0..k {
-								assert!(mag(&orth[(i, j)]) <= eps * (m + n) as f64);
+								assert!(
+									mag(&orth[(i, j)]) <= eps * (m + n) as f64
+								);
 							}
 						}
 						if m == 514 && kind == 0 {
@@ -3286,6 +3301,107 @@ mod tests {
 		);
 	}
 
+	/// `PartialPivLu::new` copies and splits on its `par` (#191): the factors and the permutation
+	/// must be the serial copy and split of the same `lu_in_place`, bit for bit, for square, tall
+	/// and wide shapes, column-major and row-major inputs, a conjugated input (the serial copy) and
+	/// teams of 1, 3 and 8 (column ranges that do not divide the width).
+	#[test]
+	fn partial_piv_lu_new_matches_the_serial_split() {
+		let rng = &mut StdRng::seed_from_u64(0x5917);
+		for (m, n) in [
+			(0usize, 0usize),
+			(1, 1),
+			(17, 17),
+			(100, 100),
+			(130, 70),
+			(70, 130),
+			(257, 33),
+			(33, 257),
+		] {
+			let A = CwiseMatDistribution {
+				nrows: m,
+				ncols: n,
+				dist: ComplexDistribution::new(StandardNormal, StandardNormal),
+			}
+			.rand::<Mat<c64>>(rng);
+			let At = A.transpose().to_owned();
+			let row_major = At.transpose();
+			// the reference: the serial copy, the factorization, the serial split
+			let reference = |A: MatRef<'_, c64>| {
+				let mut LU = A.to_owned();
+				let mut fwd = vec![0usize; m];
+				let mut bwd = vec![0usize; m];
+				linalg::lu::partial_pivoting::factor::lu_in_place(
+					LU.as_mut(),
+					&mut fwd,
+					&mut bwd,
+					Par::Seq,
+					MemStack::new(&mut MemBuffer::new(linalg::lu::partial_pivoting::factor::lu_in_place_scratch::<usize, c64>(
+						m,
+						n,
+						Par::Seq.shape(),
+						default(),
+					))),
+					default(),
+				);
+				let (L, U) = split_LU(LU);
+				(L, U, fwd)
+			};
+			let bits = |M: MatRef<'_, c64>| -> Vec<(u64, u64)> {
+				(0..M.ncols())
+					.flat_map(|j| (0..M.nrows()).map(move |i| (i, j)))
+					.map(|(i, j)| {
+						(M[(i, j)].re.to_bits(), M[(i, j)].im.to_bits())
+					})
+					.collect()
+			};
+			for (label, src) in
+				[("col-major", A.as_ref()), ("row-major", row_major)]
+			{
+				let (L_ref, U_ref, p_ref) = reference(src);
+				for width in [1usize, 3, 8] {
+					crate::team::with_team(width, |par| {
+						let lu = PartialPivLu::new(src, par);
+						assert!(
+							lu.L().shape() == L_ref.shape(),
+							"{label} {m}x{n} width={width}: L shape"
+						);
+						assert!(
+							lu.U().shape() == U_ref.shape(),
+							"{label} {m}x{n} width={width}: U shape"
+						);
+						assert!(
+							bits(lu.L()) == bits(L_ref.as_ref()),
+							"{label} {m}x{n} width={width}: L bits"
+						);
+						assert!(
+							bits(lu.U()) == bits(U_ref.as_ref()),
+							"{label} {m}x{n} width={width}: U bits"
+						);
+						assert!(
+							lu.P().arrays().0 == &p_ref[..],
+							"{label} {m}x{n} width={width}: permutation"
+						);
+					});
+				}
+			}
+			// a conjugated input takes the serial copy; its factors are those of the conjugate
+			let conj = A.conjugate();
+			let (L_ref, U_ref, _) =
+				reference(A.conjugate().to_owned().as_ref());
+			crate::team::with_team(3, |par| {
+				let lu = PartialPivLu::new(conj, par);
+				assert!(
+					bits(lu.L()) == bits(L_ref.as_ref()),
+					"conjugate {m}x{n}: L bits"
+				);
+				assert!(
+					bits(lu.U()) == bits(U_ref.as_ref()),
+					"conjugate {m}x{n}: U bits"
+				);
+			});
+		}
+	}
 	#[track_caller]
 	fn test_solver(A: MatRef<'_, c64>, A_dec: impl SolveCore<c64>) {
 		#[track_caller]
@@ -3294,13 +3410,13 @@ mod tests {
 			let n = A.nrows();
 			let approx_eq = CwiseMat(ApproxEq::eps() * 128.0 * (n as f64));
 			let k = 3;
-			let ref R = CwiseMatDistribution {
+			let R = &CwiseMatDistribution {
 				nrows: n,
 				ncols: k,
 				dist: ComplexDistribution::new(StandardNormal, StandardNormal),
 			}
 			.rand::<Mat<c64>>(rng);
-			let ref L = CwiseMatDistribution {
+			let L = &CwiseMatDistribution {
 				nrows: k,
 				ncols: n,
 				dist: ComplexDistribution::new(StandardNormal, StandardNormal),
@@ -3321,7 +3437,7 @@ mod tests {
 	fn test_all_solvers() {
 		let rng = &mut StdRng::seed_from_u64(0);
 		let n = 50;
-		let ref A = CwiseMatDistribution {
+		let A = &CwiseMatDistribution {
 			nrows: n,
 			ncols: n,
 			dist: ComplexDistribution::new(StandardNormal, StandardNormal),
@@ -3334,16 +3450,19 @@ mod tests {
 		test_solver(A, A.col_piv_qr(Par::Seq));
 		test_solver(A, A.svd(Par::Seq).unwrap());
 		{
-			let ref A = A * A.adjoint();
+			let A = &(A * A.adjoint());
 			let A = A.rb();
 			test_solver(A, A.llt(Side::Lower, Par::Seq).unwrap());
 			test_solver(A, A.ldlt(Side::Lower, Par::Seq).unwrap());
 		}
 		{
-			let ref A = A + A.adjoint();
+			let A = &(A + A.adjoint());
 			let A = A.rb();
 			test_solver(A, A.lblt(Side::Lower, Par::Seq));
-			test_solver(A, A.self_adjoint_eigen(Side::Lower, Par::Seq).unwrap());
+			test_solver(
+				A,
+				A.self_adjoint_eigen(Side::Lower, Par::Seq).unwrap(),
+			);
 		}
 	}
 	#[test]
@@ -3395,7 +3514,10 @@ mod tests {
 			assert!(& A * evd.U() ~ & B * evd.U() * e);
 		}
 		{
-			let evd = A.conjugate().generalized_eigen(B.conjugate(), Par::Seq).unwrap();
+			let evd = A
+				.conjugate()
+				.generalized_eigen(B.conjugate(), Par::Seq)
+				.unwrap();
 			let e = zip!(evd.S_a(), evd.S_b()).map(|unzip!(a, b)| a / b);
 			assert!(A.conjugate() * evd.U() ~ B.conjugate() * evd.U() * e);
 		}
@@ -3459,7 +3581,11 @@ mod tests {
 		let approx_eq = CwiseMat(ApproxEq::eps() * 128.0 * (A.nrows() as f64));
 		let svd = A.svd(Par::Seq).unwrap();
 		let mut X = B.cloned();
-		svd.solve_lstsq_in_place_with_conj(crate::Conj::No, X.as_mat_mut(), Par::Seq);
+		svd.solve_lstsq_in_place_with_conj(
+			crate::Conj::No,
+			X.as_mat_mut(),
+			Par::Seq,
+		);
 		assert!(X.get(..X_true.nrows(),..) ~ X_true);
 	}
 

@@ -1,8 +1,8 @@
 use crate::assert;
 use crate::internal_prelude::*;
-use linalg::householder::*;
 use crate::utils::cost::{ParThreshold, rate};
 use crate::utils::thread::with_width;
+use linalg::householder::*;
 use linalg::matmul::{dot, matmul};
 
 /// width of one blocked panel: `BLOCK_SIZE` columns and rows are reduced with level-2 work
@@ -41,9 +41,10 @@ pub fn bidiag_in_place_scratch<T: ComplexField>(
 		// the correction matrices live through a panel and its trailing update, and are dead
 		// before the tail allocates its own pair, so the two phases share the stack
 		let blocked = StackReq::all_of(&[
-			temp_mat_scratch::<T>(nrows, BLOCK_SIZE),
-			temp_mat_scratch::<T>(ncols, BLOCK_SIZE),
+			temp_mat_scratch::<T>(nrows, 2 * BLOCK_SIZE),
+			temp_mat_scratch::<T>(ncols, 2 * BLOCK_SIZE),
 			temp_mat_scratch::<T>(BLOCK_SIZE, 2),
+			temp_mat_scratch::<T>(ncols, BLOCK_SIZE),
 			temp_mat_scratch::<T>(ncols, 1),
 		]);
 		StackReq::any_of(&[blocked, tail])
@@ -54,6 +55,11 @@ pub fn bidiag_in_place_scratch<T: ComplexField>(
 /// bidiagonalization tuning parameters.
 #[derive(Debug, Copy, Clone)]
 pub struct BidiagParams {
+	/// whether the compact block factors (`H_left`/`H_right`) are built at the end. The
+	/// singular-value-only SVD path never reads them, and the upgrade is a serial pass over the
+	/// matrix; every other caller needs the default.
+	#[doc(hidden)]
+	pub compute_householder_factors: bool,
 	/// floor of the parallel regions: [`ParThreshold::Derived`] (the default) runs a step in
 	/// parallel when its serial time pays for its two sections; [`ParThreshold::Fixed`] counts
 	/// elements of the trailing block `(m-k-1)*(n-k-1)`
@@ -64,6 +70,7 @@ pub struct BidiagParams {
 impl<T: ComplexField> Auto<T> for BidiagParams {
 	fn auto() -> Self {
 		Self {
+			compute_householder_factors: true,
 			par_threshold: ParThreshold::Derived,
 			non_exhaustive: NonExhaustive(()),
 		}
@@ -109,6 +116,7 @@ pub fn bidiag_in_place<T: ComplexField>(
 	// holds a team around the call (see the crate docs): spinning members that keep their column
 	// range of the trailing block. the library takes no reservation itself; measured at n = 512,
 	// 8T: 19.2 ms with the team held against 25.5 ms with members woken per region.
+	let compute_factors = params.compute_householder_factors;
 	let mut p = 0;
 	if size > BLOCK_FLOOR {
 		p = bidiag_blocked_phase(
@@ -118,6 +126,7 @@ pub fn bidiag_in_place<T: ComplexField>(
 			par.reborrow(),
 			params.par_threshold,
 			stack,
+			compute_factors,
 		);
 	}
 
@@ -133,41 +142,45 @@ pub fn bidiag_in_place<T: ComplexField>(
 		p,
 	);
 
-	let mut j = 0;
-	while j < size {
-		let bl = Ord::min(bl, size - j);
-		let mut Hl = Hl.rb_mut().get_mut(..bl, j..j + bl);
-		for k in 0..bl {
-			Hl[(k, k)] = Hl[(0, k)].copy();
-		}
-		upgrade_householder_factor(
-			Hl.rb_mut(),
-			A.rb().get(j.., j..j + bl),
-			bl,
-			1,
-			par.reborrow(),
-		);
-		j += bl;
-	}
-	if size > 0 {
-		let size = size - 1;
-		let A = A.rb().get(..size, 1..);
-		let mut Hr = Hr.rb_mut().get_mut(.., ..size);
+	// the compact factors are only built when a caller will read them; the values-only SVD skips
+	// this serial pass
+	if compute_factors {
 		let mut j = 0;
 		while j < size {
-			let br = Ord::min(br, size - j);
-			let mut Hr = Hr.rb_mut().get_mut(..br, j..j + br);
-			for k in 0..br {
-				Hr[(k, k)] = Hr[(0, k)].copy();
+			let bl = Ord::min(bl, size - j);
+			let mut Hl = Hl.rb_mut().get_mut(..bl, j..j + bl);
+			for k in 0..bl {
+				Hl[(k, k)] = Hl[(0, k)].copy();
 			}
 			upgrade_householder_factor(
-				Hr.rb_mut(),
-				A.transpose().get(j.., j..j + br),
-				br,
+				Hl.rb_mut(),
+				A.rb().get(j.., j..j + bl),
+				bl,
 				1,
 				par.reborrow(),
 			);
-			j += br;
+			j += bl;
+		}
+		if size > 0 {
+			let size = size - 1;
+			let A = A.rb().get(..size, 1..);
+			let mut Hr = Hr.rb_mut().get_mut(.., ..size);
+			let mut j = 0;
+			while j < size {
+				let br = Ord::min(br, size - j);
+				let mut Hr = Hr.rb_mut().get_mut(..br, j..j + br);
+				for k in 0..br {
+					Hr[(k, k)] = Hr[(0, k)].copy();
+				}
+				upgrade_householder_factor(
+					Hr.rb_mut(),
+					A.transpose().get(j.., j..j + br),
+					br,
+					1,
+					par.reborrow(),
+				);
+				j += br;
+			}
 		}
 	}
 }
@@ -181,6 +194,7 @@ fn bidiag_blocked_phase<T: ComplexField>(
 	mut par: Par,
 	par_threshold: ParThreshold,
 	stack: &mut MemStack,
+	scatter: bool,
 ) -> usize {
 	let mut A = A;
 	let mut Hl = Hl;
@@ -189,22 +203,32 @@ fn bidiag_blocked_phase<T: ComplexField>(
 	let n = A.ncols();
 	let size = Ord::min(m, n);
 	let (mut X, stack) =
-		unsafe { temp_mat_uninit::<T, _, _>(m, BLOCK_SIZE, stack) };
+		unsafe { temp_mat_uninit::<T, _, _>(m, 2 * BLOCK_SIZE, stack) };
 	let (mut Y, stack) =
-		unsafe { temp_mat_uninit::<T, _, _>(n, BLOCK_SIZE, stack) };
+		unsafe { temp_mat_uninit::<T, _, _>(n, 2 * BLOCK_SIZE, stack) };
 	let (mut de, stack) =
 		unsafe { temp_mat_uninit::<T, _, _>(BLOCK_SIZE, 2, stack) };
+	// the panel's reflected rows, one per column so that each row is contiguous; the correction
+	// recurrences and the trailing update read them here instead of the strided rows of `A`.
+	let (mut rows, stack) =
+		unsafe { temp_mat_uninit::<T, _, _>(n, BLOCK_SIZE, stack) };
 	let (mut w, _) = unsafe { temp_mat_uninit::<T, _, _>(n, 1, stack) };
 	let mut X = X.as_mat_mut();
 	let mut Y = Y.as_mat_mut();
 	let mut de = de.as_mat_mut();
+	let mut rows = rows.as_mat_mut();
 	let mut w = w.as_mat_mut();
 	let mut p = 0;
 	while size - p > BLOCK_FLOOR {
 		// the decision is made on the full remaining area, never latched by a panel. It is the
 		// floor of the panel only: the panel's own products choose their widths, so a paying
 		// panel keeps the whole `par` rather than capping them at this estimate's width
-		let width = par_threshold.region_width::<T>(&par, (m - p) * (n - p), rate::bidiag(), 2);
+		let width = par_threshold.region_width::<T>(
+			&par,
+			(m - p) * (n - p),
+			rate::bidiag(),
+			2,
+		);
 		let width = if width > 1 { par.degree() } else { 1 };
 		with_width(par.reborrow(), width, |par| {
 			bidiag_blocked_panel(
@@ -214,7 +238,9 @@ fn bidiag_blocked_phase<T: ComplexField>(
 				X.rb_mut().get_mut(p.., ..),
 				Y.rb_mut().get_mut(p.., ..),
 				de.rb_mut(),
+				rows.rb_mut().get_mut(p.., ..),
 				w.rb_mut().col_mut(0).get_mut(p..),
+				scatter,
 				par,
 			);
 		});
@@ -223,8 +249,9 @@ fn bidiag_blocked_phase<T: ComplexField>(
 	p
 }
 
-/// reduces the first `ib` columns and rows of `A` (`ib = X.ncols()`), then updates the trailing
-/// block `A[ib.., ib..]` once with two level-3 products.
+#[allow(clippy::too_many_arguments)] // faer kernel shape, kept flat to match upstream
+/// reduces the first `ib` columns and rows of `A` (`ib = X.ncols() / 2`), then updates the trailing
+/// block `A[ib.., ib..]` once with a level-3 product of width `2 ib`.
 ///
 /// conventions, the ones the rest of this file uses: the left reflector of step `i` is the column
 /// `u_i = A[i.., i]` with unit head and `H_i = I - u_i u_i^H / tl_i`; the right one is the row
@@ -250,7 +277,9 @@ fn bidiag_blocked_panel<T: ComplexField>(
 	X: MatMut<'_, T>,
 	Y: MatMut<'_, T>,
 	de: MatMut<'_, T>,
+	mut rows: MatMut<'_, T>,
 	w: ColMut<'_, T>,
+	scatter: bool,
 	mut par: Par,
 ) {
 	let mut A = A;
@@ -262,9 +291,9 @@ fn bidiag_blocked_panel<T: ComplexField>(
 	let mut de = de;
 	let m = A.nrows();
 	let n = A.ncols();
-	let ib = X.ncols();
+	let ib = X.ncols() / 2;
 	assert!(all(
-		Y.ncols() == ib,
+		Y.ncols() == 2 * ib,
 		X.nrows() == m,
 		Y.nrows() == n,
 		Ord::min(m, n) > ib,
@@ -277,7 +306,7 @@ fn bidiag_blocked_panel<T: ComplexField>(
 		//    A[i.., i] -= V[i.., ..i] Y[i, ..i]^H + X[i.., ..i] R[..i, i]
 		let tl = {
 			let (left, right) = A.rb_mut().split_at_col_mut(i);
-			let (top, mut col) = right.col_mut(0).split_at_row_mut(i);
+			let (_, mut col) = right.col_mut(0).split_at_row_mut(i);
 			if i > 0 {
 				matmul(
 					col.rb_mut(),
@@ -291,7 +320,7 @@ fn bidiag_blocked_panel<T: ComplexField>(
 					col.rb_mut(),
 					Accum::Add,
 					X.rb().get(i.., ..i),
-					top.rb(),
+					rows.rb().row(i).get(..i).transpose(),
 					-one::<T>(),
 					Par::Seq,
 				);
@@ -306,7 +335,7 @@ fn bidiag_blocked_panel<T: ComplexField>(
 			Hl[i] = tl.to_cplx();
 			tl
 		};
-		let ref tl_inv = tl.recip();
+		let tl_inv = &tl.recip();
 
 		// 3. Y[i+1.., i] = A_i[i.., i+1..]^H u_i / tl_i, with A_i expressed through the stored
 		//    A and the corrections:
@@ -355,7 +384,7 @@ fn bidiag_blocked_panel<T: ComplexField>(
 				matmul(
 					y.rb_mut(),
 					Accum::Add,
-					A.rb().get(..i, i + 1..).adjoint(),
+					rows.rb().get(i + 1.., ..i).conjugate(),
 					t.rb(),
 					-one::<T>(),
 					Par::Seq,
@@ -368,7 +397,7 @@ fn bidiag_blocked_panel<T: ComplexField>(
 		//    of the steps before it, computed on the contiguous gather `w = A[i, i+1..]^T`:
 		//    w -= conj(Y[i+1.., ..i+1]) V[i, ..i+1]^T + R[..i, i+1..]^T X[i, ..i]^T
 		let tr = {
-			let (top, bot) = A.rb_mut().split_at_row_mut(i);
+			let (_top, bot) = A.rb_mut().split_at_row_mut(i);
 			let (left, mut row) = bot.row_mut(0).split_at_col_mut(i + 1);
 			let mut w = w.rb_mut().get_mut(i + 1..);
 			w.copy_from(row.rb().transpose());
@@ -384,7 +413,7 @@ fn bidiag_blocked_panel<T: ComplexField>(
 				matmul(
 					w.rb_mut(),
 					Accum::Add,
-					top.rb().get(.., i + 1..).transpose(),
+					rows.rb().get(i + 1.., ..i),
 					X.rb().row(i).get(..i).transpose(),
 					-one::<T>(),
 					Par::Seq,
@@ -398,10 +427,13 @@ fn bidiag_blocked_panel<T: ComplexField>(
 			de[(i, 1)] = head.copy();
 			*head = one();
 			Hr[i] = tr.to_cplx();
-			row.rb_mut().transpose_mut().copy_from(w.rb());
+			rows.rb_mut().col_mut(i).get_mut(i + 1..).copy_from(w.rb());
+			if scatter {
+				row.rb_mut().transpose_mut().copy_from(w.rb());
+			}
 			tr
 		};
-		let ref tr_inv = tr.recip();
+		let tr_inv = &tr.recip();
 
 		// 6. X[i+1.., i] = A_i'[i+1.., i+1..] r_i^H / tr_i, with `r^H = conj(w)`:
 		//    A[i+1.., i+1..] r^H - V[i+1.., ..i+1] (Y[i+1.., ..i+1]^H r^H) - X[i+1.., ..i] (R[..i, i+1..] r^H)
@@ -438,7 +470,7 @@ fn bidiag_blocked_panel<T: ComplexField>(
 				matmul(
 					t.rb_mut(),
 					Accum::Replace,
-					A.rb().get(..i, i + 1..),
+					rows.rb().get(i + 1.., ..i).transpose(),
 					r,
 					one(),
 					Par::Seq,
@@ -458,21 +490,24 @@ fn bidiag_blocked_panel<T: ComplexField>(
 
 	// trailing update, once per panel: A[ib.., ib..] -= V[ib.., ..] Y[ib.., ..]^H + X[ib.., ..] R[.., ib..]
 	{
-		let (top, bot) = A.rb_mut().split_at_row_mut(ib);
+		let (_, bot) = A.rb_mut().split_at_row_mut(ib);
 		let (v, mut a22) = bot.split_at_col_mut(ib);
-		matmul(
-			a22.rb_mut(),
-			Accum::Add,
-			v.rb(),
-			Y.rb().get(ib.., ..).adjoint(),
-			-one::<T>(),
-			par.reborrow(),
-		);
+		// One product of width `2 ib` instead of two of width `ib`: `W = [V | X]` and
+		// `Z = [R^H | Y]` are assembled in the second half of the correction storage, so the
+		// trailing block is read and written once per panel instead of twice.
+		let mut x_full = X.rb_mut().get_mut(ib.., ..);
+		let (_, mut v_slot) = x_full.rb_mut().split_at_col_mut(ib);
+		v_slot.copy_from(v.rb());
+		let mut y_full = Y.rb_mut().get_mut(ib.., ..);
+		let (mut z_head, mut z_tail) = y_full.rb_mut().split_at_col_mut(ib);
+		z_tail.copy_from(z_head.rb());
+		let top_h = rows.rb().get(ib.., ..ib);
+		z_head.copy_from(top_h.rb().conjugate());
 		matmul(
 			a22.rb_mut(),
 			Accum::Add,
 			X.rb().get(ib.., ..),
-			top.rb().get(.., ib..),
+			Y.rb().get(ib.., ..).adjoint(),
 			-one::<T>(),
 			par.reborrow(),
 		);
@@ -536,10 +571,10 @@ fn bidiag_unblocked<T: ComplexField>(
 		wk.copy_from(A12.rb());
 		let vp = wp.rb().split_at_col(k + 1).1;
 		if k > 0 {
-			let ref y1 = y1[0].copy();
-			let ref z1 = z1[0].copy();
+			let y1 = &y1[0].copy();
+			let z1 = &z1[0].copy();
 			let k1 = k - 1;
-			let ref up0 = A10[k1];
+			let up0 = &A10[k1];
 			let up = A20.rb().col(k1);
 			*a11 -= up0 * y1 + z1;
 			z!(A21.rb_mut(), up.rb(), z2.rb()).for_each(
@@ -553,50 +588,54 @@ fn bidiag_unblocked<T: ComplexField>(
 		}
 		let HouseholderInfo { tau: tl, .. } =
 			make_householder_in_place(a11, A21.rb_mut());
-		let ref tl_inv = tl.recip();
+		let tl_inv = &tl.recip();
 		Hl[k] = tl.to_cplx();
 		// the step's two products run at the widest width that pays, decided per step
-		let width = par_threshold.region_width::<T>(&par, (m - k - 1) * (n - k - 1), rate::bidiag(), 2);
+		let width = par_threshold.region_width::<T>(
+			&par,
+			(m - k - 1) * (n - k - 1),
+			rate::bidiag(),
+			2,
+		);
 		if k > 0 {
 			let k1 = k - 1;
 			let up = A20.rb().col(k1);
-			with_width(par.reborrow(), width, |mut par| {
-				match par.reborrow() {
-					Par::Seq => bidiag_fused_op(
-						A22.rb_mut(),
-						A21.rb(),
-						up.rb(),
-						z2.rb(),
-						y2.rb_mut(),
-						vp,
-						simd_align(row_offset + k + 1),
-					),
-		#[cfg(feature = "rayon")]
-					_ => {
-						use rayon::prelude::*;
-						let nthreads =
-							core::num::NonZeroUsize::new(par.degree()).unwrap().get();
-						crate::utils::thread::for_each(
-							par.reborrow(),
-							nthreads,
-							A22.rb_mut()
-								.par_col_partition_mut(nthreads)
-								.zip_eq(y2.rb_mut().par_partition_mut(nthreads))
-								.zip_eq(vp.par_partition(nthreads)),
-							|((A22, y2), vp)| {
-								bidiag_fused_op(
-									A22,
-									A21.rb(),
-									up.rb(),
-									z2.rb(),
-									y2,
-									vp.rb(),
-									simd_align(row_offset + k + 1),
-								);
-							},
-						);
-					},
-				}
+			with_width(par.reborrow(), width, |mut par| match par.reborrow() {
+				Par::Seq => bidiag_fused_op(
+					A22.rb_mut(),
+					A21.rb(),
+					up.rb(),
+					z2.rb(),
+					y2.rb_mut(),
+					vp,
+					simd_align(row_offset + k + 1),
+				),
+				#[cfg(feature = "rayon")]
+				_ => {
+					use rayon::prelude::*;
+					let nthreads = core::num::NonZeroUsize::new(par.degree())
+						.unwrap()
+						.get();
+					crate::utils::thread::for_each(
+						par.reborrow(),
+						nthreads,
+						A22.rb_mut()
+							.par_col_partition_mut(nthreads)
+							.zip_eq(y2.rb_mut().par_partition_mut(nthreads))
+							.zip_eq(vp.par_partition(nthreads)),
+						|((A22, y2), vp)| {
+							bidiag_fused_op(
+								A22,
+								A21.rb(),
+								up.rb(),
+								z2.rb(),
+								y2,
+								vp.rb(),
+								simd_align(row_offset + k + 1),
+							);
+						},
+					);
+				},
 			});
 		} else {
 			with_width(par.reborrow(), width, |par| {
@@ -619,13 +658,13 @@ fn bidiag_unblocked<T: ComplexField>(
 		// contiguous row). the row's own norm is kept for the head's restoration below.
 		let norm = wk.rb().norm_l2();
 		if norm != zero() {
-			let ref norm_inv = if norm >= min_positive() {
-				(&norm).recip()
+			let norm_inv = &(if norm >= min_positive() {
+				norm.recip()
 			} else {
-				let ref shift = from_f64::<T::Real>(4503599627370496.0);
+				let shift = &from_f64::<T::Real>(4503599627370496.0);
 				z!(wk.rb_mut()).for_each(|uz!(a)| *a = a.mul_real(shift));
 				(&norm * shift).recip()
-			};
+			});
 			z!(wk.rb_mut()).for_each(|uz!(a)| *a = a.mul_real(norm_inv));
 		}
 		with_width(par.reborrow(), width, |par| {
@@ -652,12 +691,17 @@ fn bidiag_unblocked<T: ComplexField>(
 			head_with_beta_inv: m,
 			..
 		} = make_householder_in_place(a12_a, wk_b.rb_mut().transpose_mut());
-		let ref tr_inv = tr.recip();
+		let tr_inv = &tr.recip();
 		Hr[k] = tr.to_cplx();
 		let beta = a12_a.copy();
 		*a12_a = a12_a.mul_real(norm);
-		let ref b = y2_a
-			+ dot::inner_prod(y2_b, Conj::No, wk_b.rb().transpose(), Conj::Yes);
+		let b = &(y2_a
+			+ dot::inner_prod(
+				y2_b,
+				Conj::No,
+				wk_b.rb().transpose(),
+				Conj::Yes,
+			));
 		if m != infinity() {
 			z!(z2.rb_mut(), A21.rb(), A22_a.rb()).for_each(
 				|uz!(z, u, a): Zip!(&mut T, &T, &T)| {
@@ -727,6 +771,7 @@ fn bidiag_fused_op_fallback<T: ComplexField>(
 		Par::Seq,
 	);
 }
+#[allow(clippy::extra_unused_lifetimes)] // the lifetime appears inside `Dim<'M>` argument types
 fn bidiag_fused_op_simd<'M, 'N, T: ComplexField>(
 	A22: MatMut<'_, T, usize, usize, ContiguousFwd>,
 	u: ColRef<'_, T, usize, ContiguousFwd>,
@@ -820,8 +865,12 @@ mod tests {
 		let mut Hl = Mat::zeros(bl, size);
 		let mut Hr = Mat::zeros(br, size - 1);
 		let mut UV = A.clone();
-		let mut mem =
-			MemBuffer::new(bidiag_in_place_scratch::<T>(m, n, par.shape(), params.into()));
+		let mut mem = MemBuffer::new(bidiag_in_place_scratch::<T>(
+			m,
+			n,
+			par.shape(),
+			params.into(),
+		));
 		bidiag_in_place(
 			UV.rb_mut(),
 			Hl.rb_mut(),
@@ -907,7 +956,11 @@ mod tests {
 	/// columns than the team has members.
 	#[test]
 	fn bidiag_on_a_team_reconstructs() {
-		fn check<T: crate::ComplexField<Real = f64>>(a: Mat<T>, bl: usize, br: usize) {
+		fn check<T: crate::ComplexField<Real = f64>>(
+			a: Mat<T>,
+			bl: usize,
+			br: usize,
+		) {
 			let (m, n) = a.shape();
 			let size = Ord::min(m, n);
 			let mut params: BidiagParams = crate::Auto::<T>::auto();
@@ -924,12 +977,14 @@ mod tests {
 					hl.rb_mut(),
 					hr.rb_mut(),
 					par,
-					MemStack::new(&mut MemBuffer::new(bidiag_in_place_scratch::<T>(
-						m,
-						n,
-						ParShape::team(4),
-						params.into(),
-					))),
+					MemStack::new(&mut MemBuffer::new(
+						bidiag_in_place_scratch::<T>(
+							m,
+							n,
+							ParShape::team(4),
+							params.into(),
+						),
+					)),
 					params.into(),
 				);
 			});
@@ -968,30 +1023,47 @@ mod tests {
 			let mut nonfinite = false;
 			for j in 0..n {
 				for i in 0..m {
-					let d = (uv[(i, j)].clone() - rebuilt[(i, j)].clone()).abs();
-					nonfinite |= !d.is_finite() || !uv[(i, j)].abs().is_finite();
+					let d =
+						(uv[(i, j)].clone() - rebuilt[(i, j)].clone()).abs();
+					nonfinite |=
+						!d.is_finite() || !uv[(i, j)].abs().is_finite();
 					if d.is_finite() {
 						err = err.max(d);
 					}
 				}
 			}
-			core::assert!(!nonfinite, "{m}x{n}: a non-finite factor or difference");
+			core::assert!(
+				!nonfinite,
+				"{m}x{n}: a non-finite factor or difference"
+			);
 			let scale = (0..n)
 				.flat_map(|j| (0..m).map(move |i| (i, j)))
 				.fold(0.0f64, |m, (i, j)| m.max(a[(i, j)].abs()));
-			core::assert!(err <= 1e-10 * scale.max(1.0), "{m}x{n}: {err} {scale}");
+			core::assert!(
+				err <= 1e-10 * scale.max(1.0),
+				"{m}x{n}: {err} {scale}"
+			);
 		}
 		let rng = &mut StdRng::seed_from_u64(11);
 		// the fixture of the cost tests: a real-valued matrix in the complex dtype, where the
 		// parallel route takes a different but valid factorization from the sequential one
 		let real_as_c64 = Mat::<c64>::from_fn(96, 96, |i, j| {
-			let h = (i * 2654435761usize).wrapping_add(j * 40503).wrapping_add(977) % 1009;
+			let h = (i * 2654435761usize)
+				.wrapping_add(j * 40503)
+				.wrapping_add(977)
+				% 1009;
 			c64::new(h as f64 / 504.0 - 1.0, 0.0)
 		});
 		check::<c64>(real_as_c64, 8, 8);
 		for (bl, br) in [(4usize, 3usize), (8, 8)] {
-			for (m, n) in [(8usize, 4usize), (8, 8), (40, 40), (96, 96), (37, 13)] {
-				check::<f64>(Mat::from_fn(m, n, |_, _| rand::Rng::random::<f64>(rng)), bl, br);
+			for (m, n) in
+				[(8usize, 4usize), (8, 8), (40, 40), (96, 96), (37, 13)]
+			{
+				check::<f64>(
+					Mat::from_fn(m, n, |_, _| rand::Rng::random::<f64>(rng)),
+					bl,
+					br,
+				);
 				check::<c64>(
 					Mat::from_fn(m, n, |_, _| {
 						c64::new(

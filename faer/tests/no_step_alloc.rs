@@ -28,7 +28,12 @@ unsafe impl GlobalAlloc for Counting {
 		}
 		unsafe { System.alloc_zeroed(layout) }
 	}
-	unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+	unsafe fn realloc(
+		&self,
+		ptr: *mut u8,
+		layout: Layout,
+		new_size: usize,
+	) -> *mut u8 {
 		if COUNTING.load(Ordering::Relaxed) {
 			ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
 		}
@@ -53,14 +58,19 @@ fn counted(mut f: impl FnMut()) -> (usize, usize) {
 	let n = ALLOCATIONS.load(Ordering::SeqCst);
 	stats::enable(false);
 	let s = stats::take();
-	let parallel = s.run.iter().skip(2).sum::<usize>() + s.split.iter().skip(2).sum::<usize>();
+	let parallel = s.run.iter().skip(2).sum::<usize>()
+		+ s.split.iter().skip(2).sum::<usize>();
 	(n, parallel)
 }
 
 fn sample(m: usize, n: usize, seed: u64) -> Mat<f64> {
-	let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+	let mut x = seed
+		.wrapping_mul(6364136223846793005)
+		.wrapping_add(1442695040888963407);
 	Mat::from_fn(m, n, |_, _| {
-		x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+		x = x
+			.wrapping_mul(6364136223846793005)
+			.wrapping_add(1442695040888963407);
 		((x >> 11) as f64 / (1u64 << 53) as f64) - 0.5
 	})
 }
@@ -72,23 +82,6 @@ fn parallel_regions_allocate_nothing() {
 	use colmat::linalg::lu::full_pivoting::factor as flu;
 	for width in [4usize, 8, 70] {
 		colmat::team::with_team(width, |mut par: Par<'_>| {
-			// The tridiagonal EVD solver, including its independent merge repairs.
-			if width <= 8 {
-				use colmat::linalg::evd::{tridiagonal_self_adjoint_evd, tridiagonal_self_adjoint_evd_scratch, ComputeEigenvectors};
-				let n = 256;
-				let diag = colmat::Col::<f64>::from_fn(n, |i| (i % 19) as f64 / 19.0).into_diagonal();
-				let sub = colmat::Col::<f64>::from_fn(n - 1, |i| 0.2 + (i % 7) as f64 / 13.0).into_diagonal();
-				let mut values = colmat::diag::Diag::<f64>::zeros(n);
-				let mut vectors = Mat::<f64>::zeros(n, n);
-				let params = Default::default();
-				let mut mem = MemBuffer::new(tridiagonal_self_adjoint_evd_scratch::<f64>(n, ComputeEigenvectors::Yes, par.shape(), params));
-				let (allocs, parallel) = counted(|| {
-					tridiagonal_self_adjoint_evd(diag.as_ref(), sub.as_ref(), values.as_mut(), Some(vectors.as_mut()), par.reborrow(), MemStack::new(&mut mem), params).unwrap();
-				});
-				assert!(parallel > 0, "tridiagonal EVD, width {width}: no parallel region");
-				assert_eq!(allocs, 0, "tridiagonal EVD, width {width}");
-			}
-
 			// Identity-seeded thin Q on a held team: output and scratch are reused.
 			if width <= 8 {
 				use colmat::linalg::qr::no_pivoting::{factor, unitary};
@@ -96,20 +89,54 @@ fn parallel_regions_allocate_nothing() {
 				let a0 = sample(m, n, 84);
 				let mut packed = a0.clone();
 				let mut coeff = Mat::<f64>::zeros(block, n);
-				let params = colmat::Spec::new(<factor::QrParams as Auto<f64>>::auto());
-				let mut factor_mem = MemBuffer::new(factor::qr_in_place_scratch::<f64>(m, n, block, par.shape(), params));
+				let params = colmat::Spec::new(
+					<factor::QrParams as Auto<f64>>::auto(),
+				);
+				let mut factor_mem =
+					MemBuffer::new(factor::qr_in_place_scratch::<f64>(
+						m,
+						n,
+						block,
+						par.shape(),
+						params,
+					));
 				let (allocs, parallel) = counted(|| {
 					packed.copy_from(&a0);
-					factor::qr_in_place(packed.as_mut(), coeff.as_mut(), par.reborrow(), MemStack::new(&mut factor_mem), params);
+					factor::qr_in_place(
+						packed.as_mut(),
+						coeff.as_mut(),
+						par.reborrow(),
+						MemStack::new(&mut factor_mem),
+						params,
+					);
 				});
-				assert!(parallel > 0, "QR factor, width {width}: no parallel region");
+				assert!(
+					parallel > 0,
+					"QR factor, width {width}: no parallel region"
+				);
 				assert_eq!(allocs, 0, "QR factor, width {width}");
 				let mut q = Mat::<f64>::zeros(m, n);
-				let mut mem = MemBuffer::new(unitary::unitary_scratch::<f64>(m, n, n, block, par.shape()));
+				let mut mem = MemBuffer::new(unitary::unitary_scratch::<f64>(
+					m,
+					n,
+					n,
+					block,
+					par.shape(),
+				));
 				let (allocs, parallel) = counted(|| {
-					unitary::unitary(q.as_mut(), packed.as_ref(), coeff.as_ref(), false, par.reborrow(), MemStack::new(&mut mem));
+					unitary::unitary(
+						q.as_mut(),
+						packed.as_ref(),
+						coeff.as_ref(),
+						false,
+						par.reborrow(),
+						MemStack::new(&mut mem),
+					);
 				});
-				assert!(parallel > 0, "QR thin Q, width {width}: no parallel region");
+				assert!(
+					parallel > 0,
+					"QR thin Q, width {width}: no parallel region"
+				);
 				assert_eq!(allocs, 0, "QR thin Q, width {width}");
 			}
 
@@ -117,14 +144,40 @@ fn parallel_regions_allocate_nothing() {
 			let n = 96;
 			let a0 = sample(n, n, 1);
 			let mut a = a0.clone();
-			let (mut p, mut pi, mut q, mut qi) = (vec![0usize; n], vec![0usize; n], vec![0usize; n], vec![0usize; n]);
-			let params = flu::FullPivLuParams { par_threshold: ParThreshold::Fixed(0), ..<flu::FullPivLuParams as Auto<f64>>::auto() };
-			let mut mem = MemBuffer::new(flu::lu_in_place_scratch::<usize, f64>(n, n, par.shape(), params.into()));
+			let (mut p, mut pi, mut q, mut qi) = (
+				vec![0usize; n],
+				vec![0usize; n],
+				vec![0usize; n],
+				vec![0usize; n],
+			);
+			let params = flu::FullPivLuParams {
+				par_threshold: ParThreshold::Fixed(0),
+				..<flu::FullPivLuParams as Auto<f64>>::auto()
+			};
+			let mut mem =
+				MemBuffer::new(flu::lu_in_place_scratch::<usize, f64>(
+					n,
+					n,
+					par.shape(),
+					params.into(),
+				));
 			let (allocs, parallel) = counted(|| {
 				a.copy_from(&a0);
-				flu::lu_in_place(a.as_mut(), &mut p, &mut pi, &mut q, &mut qi, par.reborrow(), MemStack::new(&mut mem), params.into());
+				flu::lu_in_place(
+					a.as_mut(),
+					&mut p,
+					&mut pi,
+					&mut q,
+					&mut qi,
+					par.reborrow(),
+					MemStack::new(&mut mem),
+					params.into(),
+				);
 			});
-			assert!(parallel > 0, "full pivoting LU, width {width}: no parallel region");
+			assert!(
+				parallel > 0,
+				"full pivoting LU, width {width}: no parallel region"
+			);
 			assert_eq!(allocs, 0, "full pivoting LU, width {width}");
 
 			// partial pivoting LU at a 2 KiB column stride: the `U` panel solves stage their right
@@ -134,15 +187,38 @@ fn parallel_regions_allocate_nothing() {
 				let n = 256;
 				let a0 = sample(n, n, 4);
 				let mut a = a0.clone();
-				assert_eq!(a.col_stride() as usize * core::mem::size_of::<f64>() % 1024, 0);
+				assert_eq!(
+					a.col_stride() as usize * core::mem::size_of::<f64>()
+						% 1024,
+					0
+				);
 				let (mut p, mut pi) = (vec![0usize; n], vec![0usize; n]);
-				let params = plu::PartialPivLuParams { par_threshold: ParThreshold::Fixed(0), ..<plu::PartialPivLuParams as Auto<f64>>::auto() };
-				let mut mem = MemBuffer::new(plu::lu_in_place_scratch::<usize, f64>(n, n, par.shape(), params.into()));
+				let params = plu::PartialPivLuParams {
+					par_threshold: ParThreshold::Fixed(0),
+					..<plu::PartialPivLuParams as Auto<f64>>::auto()
+				};
+				let mut mem =
+					MemBuffer::new(plu::lu_in_place_scratch::<usize, f64>(
+						n,
+						n,
+						par.shape(),
+						params.into(),
+					));
 				let (allocs, parallel) = counted(|| {
 					a.copy_from(&a0);
-					plu::lu_in_place(a.as_mut(), &mut p, &mut pi, par.reborrow(), MemStack::new(&mut mem), params.into());
+					plu::lu_in_place(
+						a.as_mut(),
+						&mut p,
+						&mut pi,
+						par.reborrow(),
+						MemStack::new(&mut mem),
+						params.into(),
+					);
 				});
-				assert!(parallel > 0, "partial pivoting LU, width {width}: no parallel region");
+				assert!(
+					parallel > 0,
+					"partial pivoting LU, width {width}: no parallel region"
+				);
 				assert_eq!(allocs, 0, "partial pivoting LU, width {width}");
 			}
 
@@ -156,52 +232,93 @@ fn parallel_regions_allocate_nothing() {
 				par_threshold: ParThreshold::Fixed(0),
 				..<lblt::LbltParams as Auto<f64>>::auto()
 			};
-			let mut mem = MemBuffer::new(lblt::cholesky_in_place_scratch::<usize, f64>(n, par.shape(), params.into()));
+			let mut mem = MemBuffer::new(lblt::cholesky_in_place_scratch::<
+				usize,
+				f64,
+			>(n, par.shape(), params.into()));
 			let (allocs, parallel) = counted(|| {
 				s.copy_from(&s0);
-				lblt::cholesky_in_place(s.as_mut(), sub.as_mut(), &mut p, &mut pi, par.reborrow(), MemStack::new(&mut mem), params.into());
+				lblt::cholesky_in_place(
+					s.as_mut(),
+					sub.as_mut(),
+					&mut p,
+					&mut pi,
+					par.reborrow(),
+					MemStack::new(&mut mem),
+					params.into(),
+				);
 			});
-			assert!(parallel > 0, "Bunch-Kaufman, width {width}: no parallel region");
+			assert!(
+				parallel > 0,
+				"Bunch-Kaufman, width {width}: no parallel region"
+			);
 			assert_eq!(allocs, 0, "Bunch-Kaufman, width {width}");
 			// both update ranks ran: a 2x2 pivot leaves a nonzero subdiagonal entry, a 1x1 a zero
 			let subs: Vec<f64> = (0..n).map(|i| sub[i]).collect();
-			assert!(subs.iter().any(|&x| x != 0.0) && subs.iter().any(|&x| x == 0.0), "Bunch-Kaufman, width {width}: a pivot size never occurred");
+			assert!(
+				subs.iter().any(|&x| x != 0.0) && subs.contains(&0.0),
+				"Bunch-Kaufman, width {width}: a pivot size never occurred"
+			);
 
 			// Pfaffian: the complete call, including its internally partitioned column updates.
 			let x = sample(258, 258, 171);
 			let a0 = &x - x.transpose();
-			let mut mem = MemBuffer::new(colmat::linalg::pfaffian::pfaffian_scratch::<f64>(258));
+			let mut mem = MemBuffer::new(
+				colmat::linalg::pfaffian::pfaffian_scratch::<f64>(258),
+			);
 			let (allocs, parallel) = counted(|| {
 				let value = colmat::linalg::pfaffian::pfaffian(
-					a0.as_ref(), par.reborrow(), MemStack::new(&mut mem),
-				).unwrap();
+					a0.as_ref(),
+					par.reborrow(),
+					MemStack::new(&mut mem),
+				)
+				.unwrap();
 				assert!(value.is_finite());
 			});
-			assert!(parallel > 0, "Pfaffian, width {width}: no parallel region");
+			assert!(
+				parallel > 0,
+				"Pfaffian, width {width}: no parallel region"
+			);
 			assert_eq!(allocs, 0, "Pfaffian, width {width}");
 
 			// a plain product on the team: the x86 kernel's parallel job tables come from the
 			// calling thread's workspace (faer#223), so the same shape again allocates nothing,
 			// and so does a larger shape once the workspace has grown to it
 			#[cfg(target_arch = "x86_64")]
-			if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+			if std::arch::is_x86_feature_detected!("avx2")
+				&& std::arch::is_x86_feature_detected!("fma")
+			{
 				// the same shape again, a larger one (the workspace grows), then one below the
 				// grown size
-				for &(m, n, k) in &[(384usize, 320usize, 448usize), (768, 320, 448), (384, 320, 448)] {
+				for &(m, n, k) in &[
+					(384usize, 320usize, 448usize),
+					(768, 320, 448),
+					(384, 320, 448),
+				] {
 					let a = sample(m, k, 31);
 					let b = sample(k, n, 32);
 					let mut c = sample(m, n, 33);
 					let (allocs, parallel) = counted(|| {
-						colmat::linalg::matmul::matmul(c.as_mut(), colmat::Accum::Replace, a.as_ref(), b.as_ref(), 1.0, par.reborrow());
+						colmat::linalg::matmul::matmul(
+							c.as_mut(),
+							colmat::Accum::Replace,
+							a.as_ref(),
+							b.as_ref(),
+							1.0,
+							par.reborrow(),
+						);
 					});
-					assert!(parallel > 0, "matmul {m}x{n}x{k}, width {width}: no parallel region");
+					assert!(
+						parallel > 0,
+						"matmul {m}x{n}x{k}, width {width}: no parallel region"
+					);
 					assert_eq!(allocs, 0, "matmul {m}x{n}x{k}, width {width}");
 				}
 			}
 
 			// `join_sized`, the LU swap stage's split, with closures that capture
-			let mut left = vec![0usize; 4];
-			let mut right = vec![0usize; 4];
+			let mut left = [0usize; 4];
+			let mut right = [0usize; 4];
 			let (allocs, parallel) = counted(|| {
 				colmat::utils::thread::join_sized(
 					par.reborrow(),

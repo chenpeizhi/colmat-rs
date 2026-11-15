@@ -30,9 +30,9 @@ use crate::Shape;
 use crate::internal_prelude::*;
 use crate::mat::matown::align_for;
 use crate::mat::{AsMatMut, MatMut};
+use colmat_traits::ComplexField;
 use core::marker::PhantomData;
 use dyn_stack::StackReq;
-use colmat_traits::ComplexField;
 /// returns the stack requirements for creating a temporary matrix with the
 /// given dimensions.
 pub fn temp_mat_scratch<T: ComplexField>(
@@ -223,7 +223,11 @@ pub(crate) fn copy_across_layouts<T: ComplexField>(
 	{
 		use rayon::prelude::*;
 		let dst_row_major = dst.row_stride().unsigned_abs() != 1;
-		let lines = if dst_row_major { dst.nrows() } else { dst.ncols() };
+		let lines = if dst_row_major {
+			dst.nrows()
+		} else {
+			dst.ncols()
+		};
 		let (chunk, n_tasks) =
 			copy_tasks(lines, crate::utils::thread::parallelism_degree(&par));
 		if n_tasks > 1 {
@@ -315,6 +319,144 @@ pub(crate) fn column_major_copy<T: ComplexField>(
 	fill(0, n);
 	unsafe { buf.set_len(len) };
 	buf
+}
+/// Runs `fill(j0, j1)` over column ranges that cover `0..n`, on the team when the copy
+/// split ([`copy_tasks`]) gives more than one task, else on the caller.
+fn for_column_ranges(n: usize, par: Par, fill: impl Sync + Fn(usize, usize)) {
+	#[cfg(feature = "rayon")]
+	{
+		let (chunk, n_tasks) =
+			copy_tasks(n, crate::utils::thread::parallelism_degree(&par));
+		if n_tasks > 1 {
+			crate::utils::thread::for_each(
+				par,
+				n_tasks,
+				rayon::iter::IntoParallelIterator::into_par_iter(0..n_tasks),
+				|t| fill(t * chunk, Ord::min((t + 1) * chunk, n)),
+			);
+			return;
+		}
+	}
+	let _ = par;
+	fill(0, n);
+}
+
+/// An owned column-major copy of `src`, bit for bit [`MatRef::to_owned`]'s, built on `par`:
+/// the allocation is left uninitialised and each thread writes its own columns, so the pages
+/// are first touched, and the copy runs, on the team instead of as a serial pass on the
+/// caller (tensor4all/colmat-rs#191: the owning `PartialPivLu::new` spent more time in its
+/// copies than in the factorization at 1024 on 8 threads). A row-major `src` is copied in
+/// [`copy_across_layouts_block`] tiles, one tile of columns after its zeroing.
+pub(crate) fn owned_copy<T: ComplexField>(
+	src: MatRef<'_, T>,
+	par: Par,
+) -> Mat<T> {
+	let (m, n) = src.shape();
+	let mut out = Mat::<T>::with_capacity(m, n);
+	let ld = out.col_stride() as usize;
+	let base = SendPtr(out.as_ptr_mut());
+	let row_major = src.col_stride().unsigned_abs() == 1
+		&& src.row_stride().unsigned_abs() != 1;
+	// SAFETY: the capacity holds `ld * n` elements with `ld >= m`; every task writes the `m`
+	// leading elements of its own columns (`j0..j1`, disjoint across tasks) before any view of
+	// them is formed, and `set_dims` runs once every column is written.
+	let fill = |j0: usize, j1: usize| unsafe {
+		if row_major {
+			let mut t0 = j0;
+			while t0 < j1 {
+				let t1 = Ord::min(t0 + COPY_TILE, j1);
+				for j in t0..t1 {
+					let col = base.get().add(j * ld);
+					for i in 0..m {
+						col.add(i).write(zero::<T>());
+					}
+				}
+				copy_across_layouts_block(
+					MatMut::from_raw_parts_mut(
+						base.get().add(t0 * ld),
+						m,
+						t1 - t0,
+						1,
+						ld as isize,
+					),
+					src.subcols(t0, t1 - t0),
+				);
+				t0 = t1;
+			}
+		} else {
+			for j in j0..j1 {
+				let col = base.get().add(j * ld);
+				for i in 0..m {
+					col.add(i).write(src[(i, j)].copy());
+				}
+			}
+		}
+	};
+	for_column_ranges(n, par, fill);
+	unsafe { out.set_dims(m, n) };
+	out
+}
+
+/// The `(L, U)` split of a packed `m x n` LU (unit lower trapezoidal `L`, upper trapezoidal
+/// `U`), the same values as the serial split, built on `par`: the new square factor is
+/// allocated uninitialised and written once, each column by one thread, and the packed matrix
+/// becomes the other factor in place (tensor4all/colmat-rs#191).
+pub(crate) fn split_lu_owned<T: ComplexField>(
+	LU: Mat<T>,
+	par: Par,
+) -> (Mat<T>, Mat<T>) {
+	let (m, n) = LU.shape();
+	let size = Ord::min(m, n);
+	let mut packed = LU;
+	let ld_p = packed.col_stride() as usize;
+	let p = SendPtr(packed.as_ptr_mut());
+	let mut square = Mat::<T>::with_capacity(size, size);
+	let ld_s = square.col_stride() as usize;
+	let s = SendPtr(square.as_ptr_mut());
+	let tall = m >= n;
+	// SAFETY: column `j` of both matrices is touched by the one task whose range holds `j`; the
+	// packed matrix is initialised and is assigned to, the square one is written before it is
+	// read, and `set_dims` runs once every column is written.
+	let fill = |j0: usize, j1: usize| unsafe {
+		for j in j0..j1 {
+			let pc = p.get().add(j * ld_p);
+			let sc = s.get().add(j * ld_s);
+			if tall {
+				// square = U: the upper triangle of the packed one, zeros below the diagonal;
+				// packed = L: zeros above the diagonal, ones on it
+				for i in 0..=j {
+					sc.add(i).write((*pc.add(i)).copy());
+				}
+				for i in j + 1..size {
+					sc.add(i).write(zero::<T>());
+				}
+				for i in 0..j {
+					*pc.add(i) = zero::<T>();
+				}
+				*pc.add(j) = one::<T>();
+			} else {
+				// square = L: zeros above the diagonal, ones on it, the packed strict lower
+				// triangle below; packed = U: zeros below the diagonal
+				for i in 0..j {
+					sc.add(i).write(zero::<T>());
+				}
+				sc.add(j).write(one::<T>());
+				for i in j + 1..size {
+					sc.add(i).write((*pc.add(i)).copy());
+				}
+				for i in j + 1..m {
+					*pc.add(i) = zero::<T>();
+				}
+			}
+		}
+	};
+	for_column_ranges(size, par, fill);
+	unsafe { square.set_dims(size, size) };
+	if tall {
+		(packed, square)
+	} else {
+		(square, packed)
+	}
 }
 /// The base of [`column_major_copy`]'s buffer, handed to the threads that
 /// initialise disjoint ranges of it.
@@ -445,7 +587,7 @@ impl<'a, T: ComplexField, Rows: Shape, Cols: Shape> Drop
 	#[inline]
 	fn drop(&mut self) {
 		unsafe {
-			core::ptr::drop_in_place(core::slice::from_raw_parts_mut(
+			core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(
 				self.ptr,
 				self.col_stride * self.ncols.unbound(),
 			))
@@ -495,13 +637,22 @@ impl<T> Drop for DropGuard<T> {
 	#[inline]
 	fn drop(&mut self) {
 		unsafe {
-			core::ptr::drop_in_place(core::slice::from_raw_parts_mut(
+			core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(
 				self.ptr, self.len,
 			))
 		};
 	}
 }
 /// creates a temporary matrix of uninit values, from the given memory stack.
+///
+/// # Safety
+/// The returned matrix may contain uninitialized elements (types that need drop are filled with
+/// `T::nan_impl` instead). The caller must initialize every element before reading it or forming a
+/// reference to it, including through any view derived from the returned matrix, and no other
+/// reference may alias its elements while it is alive.
+///
+/// # Panics
+/// Panics if `stack` holds less than `temp_mat_scratch::<T>(nrows, ncols)` bytes.
 #[track_caller]
 pub unsafe fn temp_mat_uninit<
 	'a,
@@ -727,7 +878,11 @@ mod tests {
 	/// `flipped` builds both so that a view whose rows are walked backwards
 	/// represents the same matrix in each -- the row-major view is read from its
 	/// last row with a negative row stride.
-	fn fixture<T: Entry>(m: usize, n: usize, flipped: bool) -> (Vec<T>, Vec<T>) {
+	fn fixture<T: Entry>(
+		m: usize,
+		n: usize,
+		flipped: bool,
+	) -> (Vec<T>, Vec<T>) {
 		let flipped = flipped && m > 0 && n > 0;
 		let row_of = |i: usize| if flipped { m - 1 - i } else { i };
 		let mut cm = Vec::with_capacity(m * n);
@@ -807,11 +962,21 @@ mod tests {
 		use crate::linalg::lu::partial_pivoting::factor as plu;
 		use crate::linalg::qr::col_pivoting::factor as cpqr;
 
-		fn check_cpqr<T: Entry>(m: usize, n: usize, flipped: bool, mut par: Par) {
+		fn check_cpqr<T: Entry>(
+			m: usize,
+			n: usize,
+			flipped: bool,
+			mut par: Par,
+		) {
 			let size = Ord::min(m, n);
 			let bs = cpqr::recommended_block_size::<T>(m, n);
-			let scratch =
-				cpqr::qr_in_place_scratch::<usize, T>(m, n, bs, par.shape(), default());
+			let scratch = cpqr::qr_in_place_scratch::<usize, T>(
+				m,
+				n,
+				bs,
+				par.shape(),
+				default(),
+			);
 			let (mut cm, mut rm) = fixture::<T>(m, n, flipped);
 			let mut h_cm = vec![T::zero(); bs * size];
 			let mut h_rm = vec![T::zero(); bs * size];
@@ -820,10 +985,10 @@ mod tests {
 			let mut pi_cm = vec![0usize; n];
 			let mut pi_rm = vec![0usize; n];
 			let mut run = |a: &mut [T],
-			           h: &mut [T],
-			           p: &mut [usize],
-			           pi: &mut [usize],
-			           (base, rs, cs): (usize, isize, isize)|
+			               h: &mut [T],
+			               p: &mut [usize],
+			               pi: &mut [usize],
+			               (base, rs, cs): (usize, isize, isize)|
 			 -> cpqr::ColPivQrInfo {
 				unsafe {
 					cpqr::qr_in_place(
@@ -850,7 +1015,13 @@ mod tests {
 					.0
 				}
 			};
-			let cm_info = run(&mut cm, &mut h_cm, &mut p_cm, &mut pi_cm, (0, 1, m as isize));
+			let cm_info = run(
+				&mut cm,
+				&mut h_cm,
+				&mut p_cm,
+				&mut pi_cm,
+				(0, 1, m as isize),
+			);
 			let rm_info = run(
 				&mut rm,
 				&mut h_rm,
@@ -869,17 +1040,27 @@ mod tests {
 			);
 		}
 
-		fn check_plu<T: Entry>(m: usize, n: usize, flipped: bool, mut par: Par) {
-			let scratch = plu::lu_in_place_scratch::<usize, T>(m, n, par.shape(), default());
+		fn check_plu<T: Entry>(
+			m: usize,
+			n: usize,
+			flipped: bool,
+			mut par: Par,
+		) {
+			let scratch = plu::lu_in_place_scratch::<usize, T>(
+				m,
+				n,
+				par.shape(),
+				default(),
+			);
 			let (mut cm, mut rm) = fixture::<T>(m, n, flipped);
 			let mut p_cm = vec![0usize; m];
 			let mut p_rm = vec![0usize; m];
 			let mut pi_cm = vec![0usize; m];
 			let mut pi_rm = vec![0usize; m];
 			let mut run = |a: &mut [T],
-			           p: &mut [usize],
-			           pi: &mut [usize],
-			           (base, rs, cs): (usize, isize, isize)|
+			               p: &mut [usize],
+			               pi: &mut [usize],
+			               (base, rs, cs): (usize, isize, isize)|
 			 -> plu::PartialPivLuInfo {
 				unsafe {
 					plu::lu_in_place(
@@ -899,7 +1080,8 @@ mod tests {
 					.0
 				}
 			};
-			let cm_info = run(&mut cm, &mut p_cm, &mut pi_cm, (0, 1, m as isize));
+			let cm_info =
+				run(&mut cm, &mut p_cm, &mut pi_cm, (0, 1, m as isize));
 			let rm_info =
 				run(&mut rm, &mut p_rm, &mut pi_rm, rm_strides(m, n, flipped));
 			// bit for bit where the copy is taken; a row-major view (`|col_stride|
@@ -928,8 +1110,18 @@ mod tests {
 			);
 		}
 
-		fn check_flu<T: Entry>(m: usize, n: usize, flipped: bool, mut par: Par) {
-			let scratch = flu::lu_in_place_scratch::<usize, T>(m, n, par.shape(), default());
+		fn check_flu<T: Entry>(
+			m: usize,
+			n: usize,
+			flipped: bool,
+			mut par: Par,
+		) {
+			let scratch = flu::lu_in_place_scratch::<usize, T>(
+				m,
+				n,
+				par.shape(),
+				default(),
+			);
 			let (mut cm, mut rm) = fixture::<T>(m, n, flipped);
 			let mut p_cm = vec![0usize; m];
 			let mut p_rm = vec![0usize; m];
@@ -940,11 +1132,11 @@ mod tests {
 			let mut ci_cm = vec![0usize; n];
 			let mut ci_rm = vec![0usize; n];
 			let mut run = |a: &mut [T],
-			           p: &mut [usize],
-			           pi: &mut [usize],
-			           c: &mut [usize],
-			           ci: &mut [usize],
-			           (base, rs, cs): (usize, isize, isize)|
+			               p: &mut [usize],
+			               pi: &mut [usize],
+			               c: &mut [usize],
+			               ci: &mut [usize],
+			               (base, rs, cs): (usize, isize, isize)|
 			 -> flu::FullPivLuInfo {
 				unsafe {
 					flu::lu_in_place(
@@ -966,8 +1158,14 @@ mod tests {
 					.0
 				}
 			};
-			let cm_info =
-				run(&mut cm, &mut p_cm, &mut pi_cm, &mut c_cm, &mut ci_cm, (0, 1, m as isize));
+			let cm_info = run(
+				&mut cm,
+				&mut p_cm,
+				&mut pi_cm,
+				&mut c_cm,
+				&mut ci_cm,
+				(0, 1, m as isize),
+			);
 			let rm_info = run(
 				&mut rm,
 				&mut p_rm,
@@ -1022,7 +1220,7 @@ mod tests {
 					check_cpqr::<crate::c64>(m, n, flipped, par);
 				};
 				run(Par::Seq);
-				crate::team::with_team(8, |par| run(par));
+				crate::team::with_team(8, run);
 			}
 		}
 		for (m, n) in [
@@ -1043,7 +1241,7 @@ mod tests {
 					check_flu::<crate::c64>(m, n, flipped, par);
 				};
 				run(Par::Seq);
-				crate::team::with_team(8, |par| run(par));
+				crate::team::with_team(8, run);
 			}
 		}
 	}
@@ -1125,7 +1323,7 @@ mod tests {
 				};
 				run(Par::Seq);
 				for threads in [2, 3, 8] {
-					crate::team::with_team(threads, |par| run(par));
+					crate::team::with_team(threads, run);
 				}
 			}
 		}
@@ -1154,9 +1352,15 @@ mod tests {
 			out.copy_from_triangular_lower(src);
 			for j in 0..n {
 				for i in 0..m {
-					let want = if i >= j { src[(i, j)].clone() } else { sentinel.clone() };
+					let want = if i >= j {
+						src[(i, j)].clone()
+					} else {
+						sentinel.clone()
+					};
 					if !out[(i, j)].same(&want) {
-						panic!("{m}x{n} flipped={flipped}: entry ({i}, {j}) differs");
+						panic!(
+							"{m}x{n} flipped={flipped}: entry ({i}, {j}) differs"
+						);
 					}
 				}
 			}
@@ -1327,7 +1531,9 @@ mod tests {
 			for j in 0..a.ncols() {
 				for i in 0..a.nrows() {
 					if !a[(i, j)].same(&b[(i, j)]) {
-						panic!("{what}: entry ({i}, {j}) differs between the two orders");
+						panic!(
+							"{what}: entry ({i}, {j}) differs between the two orders"
+						);
 					}
 				}
 			}
@@ -1344,8 +1550,10 @@ mod tests {
 				}
 				s
 			});
-			let spd_cm: Vec<f64> = (0..n * n).map(|k| spd[(k % n, k / n)]).collect();
-			let spd_rm: Vec<f64> = (0..n * n).map(|k| spd[(k / n, k % n)]).collect();
+			let spd_cm: Vec<f64> =
+				(0..n * n).map(|k| spd[(k % n, k / n)]).collect();
+			let spd_rm: Vec<f64> =
+				(0..n * n).map(|k| spd[(k / n, k % n)]).collect();
 			let run = |par: Par<'_>| {
 				let a = Llt::new(
 					MatRef::from_column_major_slice(&spd_cm, n, n),
@@ -1362,12 +1570,16 @@ mod tests {
 				same(&format!("llt {n}"), a.L(), b.L());
 			};
 			run(Par::Seq);
-			crate::team::with_team(8, |par| run(par));
+			crate::team::with_team(8, run);
 			let a = PartialPivLu::new(cm, Par::Seq);
 			let b = PartialPivLu::new(rm, Par::Seq);
 			same(&format!("lu L {n}"), a.L(), b.L());
 			same(&format!("lu U {n}"), a.U(), b.U());
-			std::assert_eq!(a.P().arrays(), b.P().arrays(), "lu {n}: permutations differ");
+			std::assert_eq!(
+				a.P().arrays(),
+				b.P().arrays(),
+				"lu {n}: permutations differ"
+			);
 		}
 	}
 }
