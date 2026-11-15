@@ -1,4 +1,5 @@
 use super::EvdError;
+mod repair;
 use crate::internal_prelude::*;
 use crate::perm::swap_cols_idx;
 use crate::utils::thread::join_raw;
@@ -602,24 +603,15 @@ fn divide_and_conquer_recurse<T: RealField>(
 		non_deflated,
 		par.reborrow(),
 	);
-	for i in 0..non_deflated {
-		let di = &permuted_diag[i].copy();
-		let mu_i = &mus[i].copy();
-		let shift_i = &shifts[i].copy();
-		let mut prod = mu_i + (shift_i - di);
-		(0..i).chain(i + 1..non_deflated).for_each(|k| {
-			let dk = &permuted_diag[k].copy();
-			let mu_k = &mus[k].copy();
-			let shift_k = &shifts[k].copy();
-			let numerator = &(mu_k + (shift_k - di));
-			let denominator = &(dk - di);
-			prod *= numerator / denominator;
-		});
-		let prod = prod.abs().sqrt();
-		let zi = permuted_z.rb_mut().at_mut(i);
-		let new_zi = if *zi < zero() { -prod } else { prod };
-		*zi = new_zi;
-	}
+	repair::weights(
+		permuted_z.rb_mut(),
+		permuted_diag.rb(),
+		mus.rb(),
+		shifts.rb(),
+		non_deflated,
+		par.reborrow(),
+	);
+
 	let mut eigenvals = z;
 	for i in 0..n {
 		eigenvals[i] = &mus[i] + &shifts[i];
@@ -646,26 +638,19 @@ fn divide_and_conquer_recurse<T: RealField>(
 			*p = pl_before[*p];
 		}
 	}
-	for (j, &pj) in pr.iter().enumerate() {
-		if pj >= non_deflated {
-			repaired_u.rb_mut().col_mut(j).fill(zero());
-			repaired_u[(pl_after[pj], j)] = one();
-		} else {
-			let mu_j = &mus[pj].copy();
-			let shift_j = &shifts[pj].copy();
-			for (i, &pl_after) in pl_after[..non_deflated].iter().enumerate() {
-				let zi = &permuted_z[i].copy();
-				let di = &permuted_diag[i].copy();
-				repaired_u[(pl_after, j)] = zi / ((di - shift_j) - mu_j);
-			}
-			for &pl_after in &pl_after[non_deflated..non_deflated + deflated] {
-				repaired_u[(pl_after, j)] = zero();
-			}
-			let inv_norm = &repaired_u.rb().col(j).norm_l2().recip();
-			z!(repaired_u.rb_mut().col_mut(j))
-				.for_each(|unzip!(x)| *x *= inv_norm);
-		}
-	}
+	repair::vectors(
+		repaired_u.rb_mut(),
+		pr,
+		pl_after,
+		permuted_diag.rb(),
+		permuted_z.rb(),
+		mus.rb(),
+		shifts.rb(),
+		non_deflated,
+		deflated,
+		par.reborrow(),
+	);
+
 	if applied_householder {
 		let mut idx = 0;
 		while idx < n {
@@ -681,13 +666,13 @@ fn divide_and_conquer_recurse<T: RealField>(
 				let tau_inv = &tau.recip();
 				for j in 0..n {
 					let mut col = repaired_u.rb_mut().col_mut(j);
-					let dot = &(tau_inv
-						* dot::inner_prod(
-							householder.as_dyn_stride().transpose(),
-							Conj::No,
-							col.rb().as_dyn_stride(),
-							Conj::No,
-						));
+					let inner = dot::inner_prod(
+						householder.as_dyn_stride().transpose(),
+						Conj::No,
+						col.rb().as_dyn_stride(),
+						Conj::No,
+					);
+					let dot = &(tau_inv * inner);
 					z!(col.rb_mut(), householder)
 						.for_each(|uz!(u, h)| *u -= dot * h);
 				}
@@ -1003,22 +988,15 @@ mod secular_split_tests {
 	use dyn_stack::MemBuffer;
 
 	fn lcg(st: &mut u64) -> f64 {
-		*st = st
-			.wrapping_mul(6364136223846793005)
-			.wrapping_add(1442695040888963407);
+		*st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
 		((*st >> 11) as f64) / ((1u64 << 53) as f64)
 	}
 
 	/// The inputs of one merge: `full` sorted poles of which the first `k` are not deflated,
 	/// and a unit `z`.
-	fn merge_input(
-		full: usize,
-		k: usize,
-		seed: u64,
-	) -> (Vec<f64>, Vec<f64>, f64) {
+	fn merge_input(full: usize, k: usize, seed: u64) -> (Vec<f64>, Vec<f64>, f64) {
 		let mut st = seed;
-		let mut d: Vec<f64> =
-			(0..full).map(|_| 4.0 * lcg(&mut st) - 2.0).collect();
+		let mut d: Vec<f64> = (0..full).map(|_| 4.0 * lcg(&mut st) - 2.0).collect();
 		d[..k].sort_by(f64::total_cmp);
 		let mut z: Vec<f64> = (0..full).map(|_| lcg(&mut st) + 0.05).collect();
 		let norm = z[..k].iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -1027,34 +1005,20 @@ mod secular_split_tests {
 	}
 
 	/// `(shifts, mus)` as bits.
-	fn roots(
-		par: Par,
-		d: &[f64],
-		z: &[f64],
-		rho: f64,
-		k: usize,
-	) -> Vec<(u64, u64)> {
+	fn roots(par: Par, d: &[f64], z: &[f64], rho: f64, k: usize) -> Vec<(u64, u64)> {
 		let full = d.len();
 		let mut mus = vec![f64::NAN; full];
 		let mut shifts = vec![f64::NAN; full];
 		compute_eigenvalues(
-			ColMut::from_slice_mut(&mut mus)
-				.try_as_col_major_mut()
-				.unwrap(),
-			ColMut::from_slice_mut(&mut shifts)
-				.try_as_col_major_mut()
-				.unwrap(),
+			ColMut::from_slice_mut(&mut mus).try_as_col_major_mut().unwrap(),
+			ColMut::from_slice_mut(&mut shifts).try_as_col_major_mut().unwrap(),
 			ColRef::from_slice(d).try_as_col_major().unwrap(),
 			ColRef::from_slice(z).try_as_col_major().unwrap(),
 			rho,
 			k,
 			par,
 		);
-		shifts
-			.iter()
-			.zip(&mus)
-			.map(|(s, m)| (s.to_bits(), m.to_bits()))
-			.collect()
+		shifts.iter().zip(&mus).map(|(s, m)| (s.to_bits(), m.to_bits())).collect()
 	}
 
 	#[test]
@@ -1089,21 +1053,17 @@ mod secular_split_tests {
 			let (d, z, rho) = merge_input(full, k, 0x391 + k as u64);
 			let seq = roots(Par::Seq, &d, &z, rho, k);
 			for threads in [2usize, 3, 8] {
-				let (first, second, width) =
-					crate::team::with_team(threads, |mut par| {
-						(
-							roots(par.reborrow(), &d, &z, rho, k),
-							roots(par.reborrow(), &d, &z, rho, k),
-							secular_width::<f64>(&par, k),
-						)
-					});
+				let (first, second, width) = crate::team::with_team(threads, |mut par| {
+					(
+						roots(par.reborrow(), &d, &z, rho, k),
+						roots(par.reborrow(), &d, &z, rho, k),
+						secular_width::<f64>(&par, k),
+					)
+				});
 				// same thread count, same split: same bits
 				assert!(first == second, "k = {k}, {threads} threads");
 				// the split changes nothing, so a different thread count, or none, does not either
-				assert!(
-					first == seq,
-					"k = {k}, {threads} threads against Par::Seq"
-				);
+				assert!(first == seq, "k = {k}, {threads} threads against Par::Seq");
 				// the gate is the cost model's, at most `k` participants and at most the team
 				assert!(width <= Ord::min(k, threads));
 			}
@@ -1115,34 +1075,29 @@ mod secular_split_tests {
 		});
 	}
 
-	#[allow(clippy::needless_range_loop)]
-	// index loop kept as written: the body indexes parallel buffers and strided views
 	/// The whole divide and conquer on a team, run twice at the same thread count: same bits
 	/// (`docs/reproducibility.md`). Against `Par::Seq` it is compared by its residual only.
+	#[allow(clippy::needless_range_loop)] // index loop kept as written: the body indexes parallel buffers
 	#[cfg(feature = "threadteam")]
 	#[test]
 	fn divide_and_conquer_on_a_team_is_reproducible() {
 		let n = 128;
 		let mut st = 0x391u64;
 		let diag: Vec<f64> = (0..n).map(|_| 2.0 * lcg(&mut st) - 1.0).collect();
-		let offdiag: Vec<f64> =
-			(0..n - 1).map(|_| 2.0 * lcg(&mut st) - 1.0).collect();
+		let offdiag: Vec<f64> = (0..n - 1).map(|_| 2.0 * lcg(&mut st) - 1.0).collect();
 		let run = |par: Par| {
 			let mut d = diag.clone();
 			let mut e = offdiag.clone();
 			let mut u = Mat::<f64>::zeros(n, n);
 			divide_and_conquer(
-				ColMut::from_slice_mut(&mut d)
-					.try_as_col_major_mut()
-					.unwrap(),
-				ColMut::from_slice_mut(&mut e)
-					.try_as_col_major_mut()
-					.unwrap(),
+				ColMut::from_slice_mut(&mut d).try_as_col_major_mut().unwrap(),
+				ColMut::from_slice_mut(&mut e).try_as_col_major_mut().unwrap(),
 				u.as_mut(),
 				par,
-				MemStack::new(&mut MemBuffer::new(
-					divide_and_conquer_scratch::<f64>(n, ParShape::Seq),
-				)),
+				MemStack::new(&mut MemBuffer::new(divide_and_conquer_scratch::<f64>(
+					n,
+					ParShape::Seq,
+				))),
 				16,
 			)
 			.unwrap();
@@ -1157,9 +1112,7 @@ mod secular_split_tests {
 			}
 			v
 		};
-		let (a, b) = crate::team::with_team(8, |mut par| {
-			(run(par.reborrow()), run(par.reborrow()))
-		});
+		let (a, b) = crate::team::with_team(8, |mut par| (run(par.reborrow()), run(par.reborrow())));
 		assert!(bits(&a) == bits(&b));
 		// residual and orthogonality of the team result
 		let (s, u) = &a;
