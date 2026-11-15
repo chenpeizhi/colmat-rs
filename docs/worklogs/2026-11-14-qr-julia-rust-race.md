@@ -17,8 +17,10 @@ The final Rust experiment carries two changes:
   this property does not apply to general matrix inputs.
 - Owning Qr uses factor/Q blocks of 16 and recursive leaves of 8 when n≤256,
   m≥2n, and the original recommended block exceeds 16. Other shapes retain the
-  original factor policy. The new `QrParams::recursion_leaf_size` defaults to 1,
-  preserving existing low-level QR, LQ and SVD choices. The caller still owns
+  original factor policy. The leaf is a crate-private argument of the factor
+  entry (`qr_in_place_with_leaf`), not a `QrParams` field: no measured case asks
+  a caller to choose it, so `QrParams` is unchanged and the public low-level QR,
+  LQ and SVD calls keep the original recursion (leaf 1). The caller still owns
   the team; products use their cost-selected budget without a fixed thread cap.
 
 Julia's selected configuration uses factor panels 16, Q panels 64, identity
@@ -35,6 +37,14 @@ The local 10% target is achieved. Final frozen-binary measurements are in siblin
 sources, both libraries, hashes, controller, all samples, process summaries,
 paired summaries and verification logs. This is machine-local probe evidence,
 not a published acceptance campaign.
+
+The leaf is asserted where reconstruction cannot: `recursion_leaf_size_controls_the_blocking_depth`
+runs the recursion sequentially and counts its nodes, so a leaf value that never
+reaches the decision (equal counts across leaves) fails the test. The
+reconstruction and orthogonality sweep over leaf widths remains, but it is not
+what establishes engagement. The `no_step_alloc` gate no longer sets the removed
+field: it exercises the identity-seeded Q path with the default recursion, which
+is what its allocation claim covers.
 
 Each start launches baseline-before, candidate, baseline-after and Julia in
 separate processes, eleven repetitions each. Native A/A labels call identical

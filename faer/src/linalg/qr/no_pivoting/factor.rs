@@ -113,9 +113,6 @@ pub fn recommended_block_size<T: ComplexField>(
 pub struct QrParams {
 	/// threshold at which blocking algorithms should be disabled
 	pub blocking_threshold: usize,
-	/// maximum recursive panel width handled by the unblocked leaf.
-	/// one preserves the original recursion; this does not limit the team width.
-	pub recursion_leaf_size: usize,
 	#[doc(hidden)]
 	pub non_exhaustive: NonExhaustive,
 }
@@ -124,10 +121,26 @@ impl<T: ComplexField> Auto<T> for QrParams {
 	fn auto() -> Self {
 		Self {
 			blocking_threshold: 48 * 48,
-			recursion_leaf_size: 1,
 			non_exhaustive: NonExhaustive(()),
 		}
 	}
+}
+/// Blocking recursion nodes entered on the calling thread, for the tests that
+/// check the leaf width reached the recursion.
+///
+/// The leaf width only changes how deep the blocking recursion goes, and a
+/// factorization that ignored it still reconstructs, so the reconstruction checks
+/// cannot tell an engaged leaf from a no-op. A test that runs the recursion
+/// sequentially reads this count and asserts that a wider leaf enters fewer
+/// nodes. It is per thread because the test harness runs tests concurrently.
+#[cfg(test)]
+std::thread_local! {
+	static RECURSION_NODES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+/// Test-only count of the blocking recursion nodes entered on the calling thread.
+#[cfg(test)]
+pub(crate) fn recursion_nodes() -> usize {
+	RECURSION_NODES.with(|c| c.get())
 }
 fn qr_in_place_blocked<T: ComplexField>(
 	A: MatMut<'_, T>,
@@ -137,9 +150,12 @@ fn qr_in_place_blocked<T: ComplexField>(
 	mut par: Par,
 	stack: &mut MemStack,
 	params: Spec<QrParams, T>,
+	leaf: usize,
 	lookahead: bool,
 	stage: bool,
 ) -> usize {
+	#[cfg(test)]
+	RECURSION_NODES.with(|c| c.set(c.get() + 1));
 	let params = params.config;
 	let (m, n) = A.shape();
 	let size = Ord::min(m, n);
@@ -148,7 +164,7 @@ fn qr_in_place_blocked<T: ComplexField>(
 	if block_size == 1 {
 		return qr_in_place_unblocked(A, H.row_mut(0), row_start, col_start);
 	}
-	let sub_block_size = if block_size <= params.recursion_leaf_size.max(1) || m * n < params.blocking_threshold {
+	let sub_block_size = if block_size <= leaf.max(1) || m * n < params.blocking_threshold {
 		1
 	} else {
 		block_size / 2
@@ -206,6 +222,7 @@ fn qr_in_place_blocked<T: ComplexField>(
 						par.reborrow(),
 						stack,
 						params.into(),
+						leaf,
 					)
 				},
 				None => qr_in_place_blocked(
@@ -216,6 +233,7 @@ fn qr_in_place_blocked<T: ComplexField>(
 					par.reborrow(),
 					stack,
 					params.into(),
+					leaf,
 					false,
 					false,
 				),
@@ -327,7 +345,7 @@ fn qr_in_place_blocked<T: ComplexField>(
 						par.reborrow(),
 						width,
 						|par| {
-							rank2 = factor_panel(A_panel, H_panel, sub2, par, MemStack::new(panel_mem), params.into());
+							rank2 = factor_panel(A_panel, H_panel, sub2, par, MemStack::new(panel_mem), params.into(), leaf);
 						},
 						|par| {
 							apply_trailing(in_cur, Q0, H_j, A_far, par, far_stack);
@@ -371,10 +389,22 @@ fn factor_panel<T: ComplexField>(
 	mut par: Par,
 	stack: &mut MemStack,
 	params: Spec<QrParams, T>,
+	leaf: usize,
 ) -> usize {
 	let mut A = A;
 	let mut H = H;
-	let local = qr_in_place_blocked(A.rb_mut(), H.rb_mut().subrows_mut(0, sub_block_size), 0, 0, par.reborrow(), stack, params, false, false);
+	let local = qr_in_place_blocked(
+		A.rb_mut(),
+		H.rb_mut().subrows_mut(0, sub_block_size),
+		0,
+		0,
+		par.reborrow(),
+		stack,
+		params,
+		leaf,
+		false,
+		false,
+	);
 	if local > 0 {
 		complete_factor(H.subcols_mut(0, local), A.rb().subcols(0, local), sub_block_size, par);
 	}
@@ -399,11 +429,12 @@ fn factor_panel_staged<T: ComplexField>(
 	mut par: Par,
 	stack: &mut MemStack,
 	params: Spec<QrParams, T>,
+	leaf: usize,
 ) -> usize {
 	let mut A = A;
 	let mut work = work;
 	linalg::copy_across_layouts(work.rb_mut(), A.rb(), par.reborrow());
-	let local = factor_panel(work.rb_mut(), H, sub_block_size, par.reborrow(), stack, params);
+	let local = factor_panel(work.rb_mut(), H, sub_block_size, par.reborrow(), stack, params, leaf);
 	linalg::copy_across_layouts(A.rb_mut(), work.rb(), par);
 	local
 }
@@ -501,11 +532,12 @@ fn qr_in_place_adapted<T: ComplexField>(
 	mut par: Par,
 	stack: &mut MemStack,
 	params: Spec<QrParams, T>,
+	leaf: usize,
 ) -> QrInfo {
 	let (m, n) = A.shape();
 	let mut work = linalg::column_major_copy(A.rb(), par.reborrow());
 	let mut work = MatMut::from_column_major_slice_mut(&mut work, m, n);
-	let info = qr_in_place(work.rb_mut(), Q_coeff, par.reborrow(), stack, params);
+	let info = qr_in_place_with_leaf(work.rb_mut(), Q_coeff, par.reborrow(), stack, params, leaf);
 	linalg::copy_across_layouts(A, work.rb(), par);
 	info
 }
@@ -516,6 +548,22 @@ pub fn qr_in_place<T: ComplexField>(
 	par: Par,
 	stack: &mut MemStack,
 	params: Spec<QrParams, T>,
+) -> QrInfo {
+	qr_in_place_with_leaf(A, Q_coeff, par, stack, params, 1)
+}
+/// [`qr_in_place`] with the blocking recursion's leaf width chosen by the caller.
+///
+/// The leaf is how the owning `Qr` driver reaches the narrower unblocked panel its
+/// scan selected; it is not a public parameter because no measured case asks a
+/// caller to choose it. One preserves the original recursion.
+#[track_caller]
+pub(crate) fn qr_in_place_with_leaf<T: ComplexField>(
+	A: MatMut<'_, T>,
+	Q_coeff: MatMut<'_, T>,
+	par: Par,
+	stack: &mut MemStack,
+	params: Spec<QrParams, T>,
+	leaf: usize,
 ) -> QrInfo {
 	let block_size = Q_coeff.nrows();
 	assert!(all(
@@ -558,9 +606,9 @@ pub fn qr_in_place<T: ComplexField>(
 			let info = linalg::lq::no_pivoting::factor::lq_in_place(A.transpose_mut(), Q_coeff, par, stack, params);
 			return QrInfo { rank: info.rank };
 		}
-		return qr_in_place_adapted(A, Q_coeff, par, stack, params);
+		return qr_in_place_adapted(A, Q_coeff, par, stack, params, leaf);
 	}
-	qr_in_place_packed(A, Q_coeff, par, stack, params, false)
+	qr_in_place_packed_with_leaf(A, Q_coeff, par, stack, params, false, leaf)
 }
 /// The factorization on the given layout, without the row-major adaptation.
 /// `lq::no_pivoting::factor::lq_in_place` factors the transposed view through
@@ -581,6 +629,18 @@ pub(crate) fn qr_in_place_packed<T: ComplexField>(
 	params: Spec<QrParams, T>,
 	stage_panels: bool,
 ) -> QrInfo {
+	qr_in_place_packed_with_leaf(A, Q_coeff, par, stack, params, stage_panels, 1)
+}
+#[track_caller]
+fn qr_in_place_packed_with_leaf<T: ComplexField>(
+	A: MatMut<'_, T>,
+	Q_coeff: MatMut<'_, T>,
+	par: Par,
+	stack: &mut MemStack,
+	params: Spec<QrParams, T>,
+	stage_panels: bool,
+	leaf: usize,
+) -> QrInfo {
 	let block_size = Q_coeff.nrows();
 	assert!(all(
 		block_size > 0,
@@ -588,7 +648,7 @@ pub(crate) fn qr_in_place_packed<T: ComplexField>(
 	));
 	let mut Q_coeff = Q_coeff;
 	let rank =
-		qr_in_place_blocked(A, Q_coeff.rb_mut(), 0, 0, par, stack, params, true, stage_panels);
+		qr_in_place_blocked(A, Q_coeff.rb_mut(), 0, 0, par, stack, params, leaf, true, stage_panels);
 	Q_coeff.rb_mut().get_mut(.., rank..).fill(zero());
 	let mut col = rank / block_size * block_size;
 	let n = Q_coeff.ncols();
@@ -1273,18 +1333,16 @@ mod tests {
 							let b = 48;
 							let mut packed = a.clone();
 							let mut h = Mat::<T>::zeros(b, k);
-							let params = Spec::new(QrParams {
-								recursion_leaf_size: leaf,
-								..<QrParams as Auto<T>>::auto()
-							});
+							let params = Spec::new(<QrParams as Auto<T>>::auto());
 							let mut mem =
 								MemBuffer::new(qr_in_place_scratch::<T>(m, n, b, par.shape(), params));
-							let rank = qr_in_place(
+							let rank = qr_in_place_with_leaf(
 								packed.as_mut(),
 								h.as_mut(),
 								par.reborrow(),
 								MemStack::new(&mut mem),
 								params,
+								leaf,
 							)
 							.rank;
 							assert!(rank <= k);
@@ -1343,6 +1401,41 @@ mod tests {
 			|r, i| crate::c32::new(r as f32, i as f32),
 			|x| x.norm() as f64,
 			1e-5,
+		);
+	}
+	/// The leaf width has to reach the recursion, and reconstruction cannot show
+	/// that: it holds for every value, including one the decision ignores. The
+	/// blocking recursion's node count can: a wider leaf stops the halving
+	/// earlier, and equal counts across leaves would mean the width is a no-op.
+	/// Sequential so that every node is entered on this test's own thread, which
+	/// is what [`recursion_nodes`] counts.
+	#[test]
+	fn recursion_leaf_size_controls_the_blocking_depth() {
+		let (m, n, block) = (512, 256, 48);
+		let mut nodes = [0usize; 3];
+		for (slot, leaf) in core::iter::zip(nodes.iter_mut(), [1, 8, 48]) {
+			let mut a = Mat::<f64>::from_fn(m, n, |i, j| {
+				((i * 37 + j * 101) % 1009) as f64 / 1009.0 - 0.5
+					+ if i == j { 1.0 } else { 0.0 }
+			});
+			let mut h = Mat::<f64>::zeros(block, Ord::min(m, n));
+			let params = Spec::new(<QrParams as Auto<f64>>::auto());
+			let mut mem =
+				MemBuffer::new(qr_in_place_scratch::<f64>(m, n, block, ParShape::Seq, params));
+			let before = recursion_nodes();
+			qr_in_place_with_leaf(
+				a.as_mut(),
+				h.as_mut(),
+				Par::Seq,
+				MemStack::new(&mut mem),
+				params,
+				leaf,
+			);
+			*slot = recursion_nodes() - before;
+		}
+		assert!(
+			nodes[0] > nodes[1] && nodes[1] > nodes[2],
+			"recursion nodes for leaf 1/8/48: {nodes:?}"
 		);
 	}
 	/// The look-ahead factors each next panel on its own participants while the trailing apply runs.

@@ -1341,11 +1341,10 @@ impl<T: ComplexField> Qr<T> {
 		let small_tall = n <= 256 && m >= n.saturating_mul(2) && recommended > 16;
 		let block_size = if small_tall { 16 } else { recommended };
 		let mut Q_coeff = Mat::zeros(block_size, size);
-		let params = Spec::new(linalg::qr::no_pivoting::factor::QrParams {
-			recursion_leaf_size: if small_tall { 8 } else { 1 },
-			..<linalg::qr::no_pivoting::factor::QrParams as Auto<T>>::auto()
-		});
-		linalg::qr::no_pivoting::factor::qr_in_place(
+		let params = Spec::new(<linalg::qr::no_pivoting::factor::QrParams as Auto<T>>::auto());
+		// The leaf is internal: `qr_in_place_with_leaf` is the crate-private entry
+		// that carries the experiment's narrower unblocked panel to the recursion.
+		linalg::qr::no_pivoting::factor::qr_in_place_with_leaf(
 			QR.as_mut(),
 			Q_coeff.as_mut(),
 			par.reborrow(),
@@ -1359,6 +1358,7 @@ impl<T: ComplexField> Qr<T> {
 				),
 			)),
 			params,
+			if small_tall { 8 } else { 1 },
 		);
 		let (Q_basis, R) = split_LU(QR);
 		Self {
