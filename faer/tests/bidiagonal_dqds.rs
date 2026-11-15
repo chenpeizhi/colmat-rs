@@ -99,3 +99,24 @@ macro_rules! contracts {
 }
 contracts!(dqds_real32, f32, 2e-4);
 contracts!(dqds_real64, f64, 1e-11);
+
+#[test]
+fn dqds_rejects_underresolved_squared_values() {
+	macro_rules! check {
+		($t:ty,$small:expr) => {{
+			let mut d = [$small as $t, 1.0];
+			let e = [0.25 as $t];
+			let before = d.map(|x| x.to_bits());
+			let mut memory = MemBuffer::new(bidiagonal_dqds_scratch::<$t>(2));
+			let result =
+				bidiagonal_dqds(&mut d, &e, MemStack::new(&mut memory));
+			assert!(
+				matches!(result, Err(SvdError::NoConvergence)),
+				"underresolved values reported success: {d:?}"
+			);
+			assert_eq!(d.map(|x| x.to_bits()), before);
+		}};
+	}
+	check!(f32, 1e-22);
+	check!(f64, 1e-161);
+}

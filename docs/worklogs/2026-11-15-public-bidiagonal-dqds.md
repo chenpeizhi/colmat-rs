@@ -28,3 +28,12 @@ the new public tests exercise the added boundary. Both executable documentation 
 and hosted checks are still pending. No performance result or campaign adoption is claimed.
 The existing decomposition kernels and dispatch are unchanged, so this is an
 API extension rather than a decomposition performance experiment.
+
+
+The public boundary also rejects successful private results whose normalized
+squared singular values are subnormal. Merely checking for finite positive
+outputs missed relative errors of about 2% (f32) and 0.13% (f64) for two-by-two
+bidiagonals with a tiny first diagonal. The regression fails on the initial API
+and requires unchanged-input nonconvergence, so the LASQ1 adapter can retain its
+reference routine's small-value accuracy. The private kernel and its existing
+callers remain unchanged; this is validation of the new public boundary.

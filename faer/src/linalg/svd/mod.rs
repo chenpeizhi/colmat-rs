@@ -461,7 +461,8 @@ pub fn bidiagonal_dqds_scratch<T: RealField>(dim: usize) -> StackReq {
 /// # Errors
 /// Returns [`SvdError::NoConvergence`] for nonfinite input, a zero diagonal in
 /// dimension greater than one, failure of the dqds iteration (including a
-/// squared-factor range limitation), or nonfinite output. The original inputs
+/// squared-factor range limitation), nonfinite output, or a normalized squared
+/// singular value in the subnormal range (where relative precision was lost). The original inputs
 /// remain available for recovery; no LAPACK-specific iteration status or
 /// intermediate qd-factor representation is promised.
 ///
@@ -505,7 +506,23 @@ pub fn bidiagonal_dqds<T: RealField>(
 	let (mut staged_off, stack) =
 		stack.make_with::<T>(n - 1, |i| offdiag[i].copy());
 	dqds::singular_values(&mut staged_diag, &mut staged_off, stack)?;
-	if !staged_diag.iter().all(|x| x.is_finite() && *x > zero()) {
+	let scale = diag
+		.iter()
+		.chain(offdiag)
+		.fold(zero::<T>(), |scale, x| scale.fmax(x.abs()));
+	// The private iteration normalizes by the input scale before squaring.
+	// A subnormal squared value has already lost relative precision, even
+	// when its square root is finite and positive. Keep the original input
+	// available for recovery instead of committing such a successful result.
+	let minimum = min_positive::<T>();
+	if !staged_diag.iter().all(|x| {
+		if !x.is_finite() || *x <= zero() {
+			return false;
+		}
+		let normalized = x.copy() / scale.copy();
+		let square = normalized.copy() * normalized;
+		square.is_finite() && square >= minimum
+	}) {
 		return Err(SvdError::NoConvergence);
 	}
 	diag.clone_from_slice(&staged_diag);
