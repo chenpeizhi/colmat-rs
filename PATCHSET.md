@@ -10,6 +10,10 @@ upstream `faer`.
   Tridiagonal reduction is unchanged. Local f64 512/8T paired reference scan:
   whole-call ratio 0.7502; host-only estimates, campaign and 64-core validation
   still pending. [Isolation, evidence and limits](docs/worklogs/2026-11-14-eigh-parallel-repair.md).
+  evo reproduction (tensor4all/colmat-rs#193; Ryzen AI 9 HX 470, pinned harness, CPUs 4 / 4-7 / 4-11,
+  main `d1d17881` vs `8f8ae598`, 3 process sets): f64 8T 0.886-0.902 (256/512) and 0.904-0.908 (768),
+  4T 0.941-0.955, 1T 0.991-1.010; c64 8T 0.915-0.931, 4T 0.957-0.968, 1T 1.000-1.003. The direction
+  holds; the size is about 40 % of the local/Xeon 21-25 %.
 
 ## Pending public API extension
 
