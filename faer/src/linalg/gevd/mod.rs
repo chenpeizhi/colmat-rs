@@ -1962,6 +1962,277 @@ pub fn gevd_cplx<T: ComplexField>(
 		qz_to_gevd_cplx,
 	)
 }
+
+/// computes the layout of the workspace required to compute the eigenvectors
+/// of a saved generalized Schur pencil
+///
+/// the pencil itself needs no workspace; the scratch covers the back
+/// substitution of [`gevd_from_schur_real`] and [`gevd_from_schur_cplx`].
+///
+/// # examples
+/// ```
+/// use colmat::ParShape;
+/// use colmat::linalg::gevd::gevd_from_schur_scratch;
+/// let req = gevd_from_schur_scratch::<f64>(4, ParShape::Seq);
+/// let _mem = dyn_stack::MemBuffer::new(req);
+/// ```
+pub fn gevd_from_schur_scratch<T: ComplexField>(
+	dim: usize,
+	par: ParShape,
+) -> StackReq {
+	if const { T::IS_REAL } {
+		qz_to_gevd_real_scratch::<T::Real>(dim, par)
+	} else {
+		qz_to_gevd_cplx_scratch::<T>(dim, par)
+	}
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)] // faer kernel shape, kept flat to match upstream
+fn gevd_from_schur_imp<T: ComplexField>(
+	s: MatRef<'_, T>,
+	t: MatRef<'_, T>,
+	q: Option<MatRef<'_, T>>,
+	z: Option<MatRef<'_, T>>,
+	u_left: Option<MatMut<'_, T>>,
+	u_right: Option<MatMut<'_, T>>,
+	par: Par,
+	stack: &mut MemStack,
+	qz_to_gevd: fn(
+		MatRef<'_, T>,
+		MatRef<'_, T>,
+		Option<MatMut<'_, T>>,
+		Option<MatMut<'_, T>>,
+		Par,
+		&mut MemStack,
+	),
+) -> Result<(), GevdError> {
+	let n = s.nrows();
+	assert!(all(s.ncols() == n, t.nrows() == n, t.ncols() == n));
+	for x in [q, z].into_iter().flatten() {
+		assert!(all(x.nrows() == n, x.ncols() == n));
+	}
+	for x in [u_left.rb(), u_right.rb()].into_iter().flatten() {
+		assert!(all(x.nrows() == n, x.ncols() == n));
+	}
+	let finite = s.is_all_finite()
+		&& t.is_all_finite()
+		&& q.is_none_or(|q| q.is_all_finite())
+		&& z.is_none_or(|z| z.is_all_finite());
+	let mut u_left = u_left;
+	let mut u_right = u_right;
+	if !finite {
+		for mut u in [u_left.rb_mut(), u_right.rb_mut()].into_iter().flatten() {
+			u.fill(nan());
+		}
+		return Err(GevdError::NoConvergence);
+	}
+	if n == 0 {
+		return Ok(());
+	}
+	// the conversion stage back-transforms in place: it reads the columns of
+	// its output buffer as the columns of `Q` (resp. `Z`) and overwrites them
+	// with the vectors of the original pencil, block by block, before it reads
+	// them again. so the buffer has to hold the transformation on entry, and
+	// the identity when the pencil's own vectors are requested
+	for (u, x) in [(u_left.rb_mut(), q), (u_right.rb_mut(), z)] {
+		let Some(mut u) = u else { continue };
+		if let Some(x) = x {
+			u.copy_from(x);
+		} else {
+			u.fill(zero());
+			u.diagonal_mut().column_vector_mut().fill(one());
+		}
+	}
+	qz_to_gevd(s, t, u_left.rb_mut(), u_right.rb_mut(), par, stack);
+	for u in [u_left.rb(), u_right.rb()].into_iter().flatten() {
+		if !u.is_all_finite() {
+			return Err(GevdError::NoConvergence);
+		}
+	}
+	Ok(())
+}
+
+/// computes the eigenvectors of a saved real generalized Schur pencil
+///
+/// `s` and `t` are the factors of the pencil $(A, B) = (Q S Z^T, Q T Z^T)$ in
+/// real generalized Schur form: $S$ is upper quasi-triangular with $1 \times 1$
+/// and $2 \times 2$ diagonal blocks and $T$ is upper triangular, as
+/// [`gen_hessenberg::generalized_hessenberg`] and
+/// [`qz_real::hessenberg_to_qz`] leave them. that form is a precondition and is
+/// not checked: another pair gives an unspecified result. neither factor is
+/// read mutably, reduced or reordered, so the vectors follow the pencil's
+/// diagonal order, including infinite eigenvalues ($t_{jj} = 0$).
+///
+/// the left eigenvectors are written to `u_left` and the right eigenvectors to
+/// `u_right`, each optional. the requested matrices are outputs only; their
+/// previous contents are never read. a $1 \times 1$ block writes one column of
+/// unit 2-norm. a $2 \times 2$ block writes two columns, and
+/// `u_left[:, j] + i u_left[:, j + 1]` (and likewise `u_right`) is the vector of
+/// the eigenvalue with positive imaginary part, normalized as one complex
+/// vector: the conjugate-pair encoding and order of [`gevd_real`] and
+/// [`schur_eigenvalues_real`]. a block whose diagonal entries of both factors
+/// are below the safe minimum (a nonregular $0/0$ block) writes the unit vector
+/// $e_j$, without the back-transformation, as LAPACK `dtgevc` does.
+///
+/// `q` and `z` are the QZ transformations of the original pencil. when given,
+/// the columns are back-transformed by $Q$ (resp. $Z$) and are the vectors of
+/// $(A, B)$; when `None`, the vectors of $(S, T)$ itself are returned.
+///
+/// # range
+///
+/// the vectors are computed from the factors as given, so they are only as
+/// accurate as the factors' scaling allows. a block whose $s_{jj}$ or $t_{jj}$
+/// underflows against the largest entry of the factors, for example
+/// $s = [[1, 1], [0, 2 \cdot 10^{-200}]]$ with $t = \mathrm{diag}(1,
+/// 10^{-200})$, makes the block's pair of coefficients collapse to zero; that
+/// column is then not an eigenvector of the block although the call returns
+/// `Ok`. neither factor is rescaled, since the caller owns the pencil and its
+/// order. the same stage runs inside [`gevd_real`] and [`gevd_cplx`].
+///
+/// # errors
+///
+/// [`GevdError::NoConvergence`] when any of `s`, `t`, `q`, `z` is not finite (a
+/// non-finite transformation is rejected even when its output is not
+/// requested), or when a requested output comes out non-finite. in the first
+/// case the requested outputs are filled with NaN; in the second their
+/// contents are unspecified.
+///
+/// # panics
+/// panics if `s` and `t` are not square with equal shapes, if a given
+/// transformation or output does not have that shape, or if the stack is
+/// smaller than [`gevd_from_schur_scratch`].
+///
+/// # examples
+/// ```
+/// use colmat::dyn_stack::{MemBuffer, MemStack};
+/// use colmat::linalg::gevd::{gevd_from_schur_real, gevd_from_schur_scratch};
+/// use colmat::{Mat, Par, ParShape};
+/// // eigenvalues 2/1 and 3/0 (infinite), in this order
+/// let s = colmat::mat![[2.0f64, 1.0], [0.0, 3.0]];
+/// let t = colmat::mat![[1.0f64, 0.5], [0.0, 0.0]];
+/// let mut u = Mat::<f64>::zeros(2, 2);
+/// let mut mem =
+///     MemBuffer::new(gevd_from_schur_scratch::<f64>(2, ParShape::Seq));
+/// gevd_from_schur_real(
+///     s.as_ref(),
+///     t.as_ref(),
+///     None,
+///     None,
+///     None,
+///     Some(u.as_mut()),
+///     Par::Seq,
+///     MemStack::new(&mut mem),
+///     Default::default(),
+/// )
+/// .unwrap();
+/// assert!((u[(0, 0)].abs() - 1.0).abs() < 1e-15);
+/// assert!(u[(1, 0)] == 0.0);
+/// // the infinite eigenvalue: `t v = 0`
+/// assert!((u[(0, 1)] + 0.5 * u[(1, 1)]).abs() < 1e-15);
+/// ```
+#[allow(clippy::too_many_arguments)] // faer kernel shape, kept flat to match upstream
+#[track_caller]
+pub fn gevd_from_schur_real<T: RealField>(
+	s: MatRef<'_, T>,
+	t: MatRef<'_, T>,
+	q: Option<MatRef<'_, T>>,
+	z: Option<MatRef<'_, T>>,
+	u_left: Option<MatMut<'_, T>>,
+	u_right: Option<MatMut<'_, T>>,
+	par: Par,
+	stack: &mut MemStack,
+	params: Spec<GevdFromSchurParams, T>,
+) -> Result<(), GevdError> {
+	let _ = params;
+	gevd_from_schur_imp(
+		s,
+		t,
+		q,
+		z,
+		u_left,
+		u_right,
+		par,
+		stack,
+		qz_to_gevd_real,
+	)
+}
+
+/// computes the eigenvectors of a saved complex generalized Schur pencil
+///
+/// the complex counterpart of [`gevd_from_schur_real`]: `s` and `t` are upper
+/// triangular factors of $(A, B) = (Q S Z^H, Q T Z^H)$, as
+/// [`qz_cplx::hessenberg_to_qz`] leaves them, and every column is one vector of
+/// unit 2-norm, in the pencil's diagonal order. `q` and `z` back-transform by
+/// $Q$ and $Z$ as there; an infinite eigenvalue ($t_{jj} = 0$) and a nonregular
+/// $0/0$ block behave as there.
+///
+/// the diagonal of $T$ must be real, as the standardization inside
+/// [`qz_cplx::hessenberg_to_qz`] leaves it. this stage does not check it: a
+/// complex $t_{jj}$ scales its shift by $\Re t_{jj}$ instead, so the column is
+/// the vector of the pencil whose $t_{jj}$ is replaced by its real part, even
+/// though the call returns `Ok`.
+///
+/// # errors
+/// as [`gevd_from_schur_real`].
+///
+/// # panics
+/// as [`gevd_from_schur_real`].
+///
+/// # examples
+/// ```
+/// use colmat::dyn_stack::{MemBuffer, MemStack};
+/// use colmat::linalg::gevd::{gevd_from_schur_cplx, gevd_from_schur_scratch};
+/// use colmat::{Mat, Par, ParShape, c64};
+/// let s = colmat::mat![
+///     [c64::new(1.0, 2.0), c64::new(0.0, 0.0)],
+///     [c64::new(0.0, 0.0), c64::new(2.0, 0.0)]
+/// ];
+/// let t = Mat::<c64>::identity(2, 2);
+/// let mut u = Mat::<c64>::zeros(2, 2);
+/// let mut mem =
+///     MemBuffer::new(gevd_from_schur_scratch::<c64>(2, ParShape::Seq));
+/// gevd_from_schur_cplx(
+///     s.as_ref(),
+///     t.as_ref(),
+///     None,
+///     None,
+///     Some(u.as_mut()),
+///     None,
+///     Par::Seq,
+///     MemStack::new(&mut mem),
+///     Default::default(),
+/// )
+/// .unwrap();
+/// // a diagonal pencil: the two vectors are e0 and e1
+/// assert!((u[(0, 0)].norm() - 1.0).abs() < 1e-15);
+/// assert!((u[(1, 1)].norm() - 1.0).abs() < 1e-15);
+/// ```
+#[allow(clippy::too_many_arguments)] // faer kernel shape, kept flat to match upstream
+#[track_caller]
+pub fn gevd_from_schur_cplx<T: ComplexField>(
+	s: MatRef<'_, T>,
+	t: MatRef<'_, T>,
+	q: Option<MatRef<'_, T>>,
+	z: Option<MatRef<'_, T>>,
+	u_left: Option<MatMut<'_, T>>,
+	u_right: Option<MatMut<'_, T>>,
+	par: Par,
+	stack: &mut MemStack,
+	params: Spec<GevdFromSchurParams, T>,
+) -> Result<(), GevdError> {
+	let _ = params;
+	gevd_from_schur_imp(
+		s,
+		t,
+		q,
+		z,
+		u_left,
+		u_right,
+		par,
+		stack,
+		qz_to_gevd_cplx,
+	)
+}
 #[cfg(test)]
 mod tests {
 	use super::*;
