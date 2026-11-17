@@ -11,7 +11,10 @@
 use colmat::diag::Diag;
 use colmat::dyn_stack::{MemBuffer, MemStack};
 use colmat::linalg::evd::ComputeEigenvectors;
-use colmat::linalg::gevd::{GevdParams, gevd_cplx, gevd_real, gevd_scratch};
+use colmat::linalg::gevd::{
+	GevdParams, gevd_cplx, gevd_from_schur_cplx, gevd_from_schur_real,
+	gevd_from_schur_scratch, gevd_real, gevd_scratch,
+};
 use colmat::{Mat, Par, ParShape, Spec, c64};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -171,6 +174,112 @@ fn gevd_warm_call_does_not_allocate() {
 					failures.push((n, s, ce, r, c));
 				}
 			}
+		}
+	}
+	assert!(failures.is_empty(), "allocations: {failures:?}");
+}
+
+/// A saved real Schur pencil: quasi-triangular `S`, triangular `T`, a `2x2`
+/// block with equal diagonals at the top, and infinite eigenvalues at the end.
+fn saved_real(n: usize) -> (Mat<f64>, Mat<f64>) {
+	let mut s = Mat::<f64>::zeros(n, n);
+	let mut t = Mat::<f64>::zeros(n, n);
+	for j in 0..n {
+		for r in 0..j {
+			s[(r, j)] = 0.05 * sample(r, j, 7);
+			t[(r, j)] = 0.05 * sample(r, j, 8);
+		}
+		s[(j, j)] = 2.0 + j as f64 * 0.25;
+		t[(j, j)] = 1.0 + j as f64 * 0.125;
+	}
+	s[(0, 0)] = 1.5;
+	s[(0, 1)] = 0.75;
+	s[(1, 0)] = -0.5;
+	s[(1, 1)] = 1.5;
+	t[(0, 0)] = 1.0;
+	t[(1, 1)] = 1.0;
+	for j in n.saturating_sub(2)..n {
+		t[(j, j)] = 0.0;
+	}
+	(s, t)
+}
+
+/// The complex counterpart, with `T`'s diagonal real, as `qz_cplx` leaves it.
+fn saved_cplx(n: usize) -> (Mat<c64>, Mat<c64>) {
+	let mut s = Mat::<c64>::zeros(n, n);
+	let mut t = Mat::<c64>::zeros(n, n);
+	for j in 0..n {
+		for r in 0..j {
+			s[(r, j)] =
+				c64::new(0.05 * sample(r, j, 7), 0.05 * sample(r, j, 9));
+			t[(r, j)] =
+				c64::new(0.05 * sample(r, j, 8), 0.05 * sample(r, j, 10));
+		}
+		s[(j, j)] = c64::new(2.0 + j as f64 * 0.25, 0.5);
+		t[(j, j)] = c64::new(1.0 + j as f64 * 0.125, 0.0);
+	}
+	for j in n.saturating_sub(2)..n {
+		t[(j, j)] = c64::new(0.0, 0.0);
+	}
+	(s, t)
+}
+
+fn from_schur_real_allocations(n: usize) -> usize {
+	let (s, t) = saved_real(n);
+	let (q, z) = (Mat::<f64>::identity(n, n), Mat::<f64>::identity(n, n));
+	let (mut ul, mut ur) = (Mat::<f64>::zeros(n, n), Mat::<f64>::zeros(n, n));
+	let mut mem =
+		MemBuffer::new(gevd_from_schur_scratch::<f64>(n, ParShape::Seq));
+	warm(|| {
+		gevd_from_schur_real(
+			s.as_ref(),
+			t.as_ref(),
+			Some(q.as_ref()),
+			Some(z.as_ref()),
+			Some(ul.as_mut()),
+			Some(ur.as_mut()),
+			Par::Seq,
+			MemStack::new(&mut mem),
+			Spec::default(),
+		)
+		.unwrap();
+	})
+}
+
+fn from_schur_cplx_allocations(n: usize) -> usize {
+	let (s, t) = saved_cplx(n);
+	let (q, z) = (Mat::<c64>::identity(n, n), Mat::<c64>::identity(n, n));
+	let (mut ul, mut ur) = (Mat::<c64>::zeros(n, n), Mat::<c64>::zeros(n, n));
+	let mut mem =
+		MemBuffer::new(gevd_from_schur_scratch::<c64>(n, ParShape::Seq));
+	warm(|| {
+		gevd_from_schur_cplx(
+			s.as_ref(),
+			t.as_ref(),
+			Some(q.as_ref()),
+			Some(z.as_ref()),
+			Some(ul.as_mut()),
+			Some(ur.as_mut()),
+			Par::Seq,
+			MemStack::new(&mut mem),
+			Spec::default(),
+		)
+		.unwrap();
+	})
+}
+
+#[test]
+fn gevd_from_schur_warm_call_does_not_allocate() {
+	let mut failures = Vec::new();
+	for n in [8usize, 100] {
+		let r = from_schur_real_allocations(n);
+		let c = from_schur_cplx_allocations(n);
+		println!(
+			"n = {n}: gevd_from_schur_real {r}, gevd_from_schur_cplx {c} \
+			 allocations"
+		);
+		if r != 0 || c != 0 {
+			failures.push((n, r, c));
 		}
 	}
 	assert!(failures.is_empty(), "allocations: {failures:?}");

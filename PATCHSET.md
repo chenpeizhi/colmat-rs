@@ -26,6 +26,15 @@ upstream `faer`.
   numerical dispatch or allocation; focused public API and doctest validation
   are recorded in the proposing PR. No performance claim or adoption is made.
 
+- EXPERIMENT: `gevd_from_schur_real` / `gevd_from_schur_cplx` (with
+  `gevd_from_schur_scratch`) publish the eigenvectors of an existing generalized
+  Schur pencil, so a saved `(S, T, Q, Z)` no longer has to be re-reduced through
+  `gevd_real` / `gevd_cplx` ([#211](https://github.com/tensor4all/colmat-rs/issues/211),
+  AtelierArith/Colmat.jl#313). They call the same private conversion stage, so
+  no new numerical path and no change to the existing entry points; the
+  allocation gate, residual and back-transformation tests are recorded in the
+  proposing PR. No performance claim or adoption is made. [Design and verification scope](docs/worklogs/2026-11-17-gevd-from-saved-schur.md).
+
 ## Status legend
 
 - **TODO** — not started. The issue column names the driving issue, or `—`.

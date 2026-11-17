@@ -37,6 +37,7 @@ type, so one Rust function serves all four where the algorithm applies to comple
 | `?ggev` | Generalized nonsymmetric eigenproblem | `MatRef::generalized_eigen(b, par)` | `faer/src/linalg/solvers.rs:795` |
 | `?gees` | Schur factorization | `multishift_qr` (real and complex) | `faer/src/linalg/evd/schur/real_schur.rs:2427`, `faer/src/linalg/evd/schur/complex_schur.rs:643` |
 | `?trevc` | Eigenvectors from a Schur form | `eigenvectors_from_schur_real`, `eigenvectors_from_schur_cplx` | `faer/src/linalg/evd/mod.rs:1797`, `:1866` |
+| `?tgevc` | Eigenvectors from a generalized Schur form | `gevd_from_schur_real`, `gevd_from_schur_cplx` | `faer/src/linalg/gevd/mod.rs:2135`, `:2212` |
 | `?trtri` | Triangular inverse | `invert_lower_triangular`, `invert_upper_triangular` | `faer/src/linalg/triangular_inverse.rs:171`, `:216` |
 | `?trsv`, `?trsm` | Triangular solve | `solve_lower_triangular_in_place`, `solve_upper_triangular_in_place` | `faer/src/linalg/triangular_solve.rs:283`, `:385` |
 | `?larfg` | Generate a Householder reflector | `make_householder_in_place` | `faer/src/linalg/householder.rs:117` |
