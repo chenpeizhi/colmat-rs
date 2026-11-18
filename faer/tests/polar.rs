@@ -324,15 +324,29 @@ fn polar_qdwh_backward_stable_nearly_singular() {
 }
 
 #[test]
-fn polar_qdwh_rejects_non_finite_input() {
-	let mut a = sample_mat::<f64>(6, 4, 5);
-	a[(2, 1)] = f64::NAN;
-	for a in [a.as_ref(), a.transpose()] {
-		assert_eq!(
-			polar(a, PolarMethod::Qdwh, Par::Seq).unwrap_err(),
-			PolarError::NoConvergence
-		);
+fn polar_rejects_non_finite_input() {
+	fn rejects<T: Scalar>() {
+		for (m, n) in [(6, 4), (5, 5)] {
+			for bad in [f64::NAN, f64::INFINITY] {
+				let mut a = sample_mat::<T>(m, n, 5);
+				a[(2, 1)] = T::from_f64(bad);
+				for method in METHODS {
+					// left on the matrix, right on its transpose
+					for a in [a.as_ref(), a.transpose()] {
+						assert_eq!(
+							polar(a, method, Par::Seq).err(),
+							Some(PolarError::NoConvergence),
+							"{m}x{n} {method:?} {bad}"
+						);
+					}
+				}
+			}
+		}
 	}
+	rejects::<f64>();
+	rejects::<f32>();
+	rejects::<c64>();
+	rejects::<c32>();
 }
 
 /// A row-major input, and outputs that are views into larger buffers (column stride above the row
