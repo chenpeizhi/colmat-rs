@@ -4,6 +4,9 @@ Numbers are tensor4all/colmat-rs issues or PRs.
 
 ## Correctness
 
+- `norm_l2` no longer returns infinity or zero for representable norms at the
+  ends of the floating-point range (#229). The SIMD path widens its scaling
+  factors, and strided views scale entries before summing squares.
 - A `Par::Team` holding a team of one participant took the kernels' parallel branches with one
   thread instead of running sequentially: `utils::thread::with_width` returned it unchanged
   before checking for a width below two. An `n x 1` product then kept an `n`-element partial
