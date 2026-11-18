@@ -2,6 +2,17 @@ use super::LINEAR_IMPL_THRESHOLD;
 use crate::internal_prelude::*;
 use colmat_traits::RealReg;
 use num_complex::Complex;
+
+#[inline]
+fn range_scales<R: RealField>() -> (R, R) {
+	// Widen both power-of-two scales so even MIN_SUBNORMAL and MAX can be squared.
+	let eps = &eps::<R>();
+	(
+		sqrt_min_positive::<R>() * eps,
+		sqrt_max_positive::<R>() / eps,
+	)
+}
+
 #[inline(always)]
 fn norm_l2_simd<'N, T: ComplexField>(
 	data: ColRef<'_, T, Dim<'N>, ContiguousFwd>,
@@ -16,12 +27,9 @@ fn norm_l2_simd<'N, T: ComplexField>(
 		fn with_simd<S: pulp::Simd>(self, simd: S) -> Self::Output {
 			let Self { data } = self;
 			let simd = SimdCtx::<T, S>::new(T::simd_ctx(simd), data.nrows());
-			#[allow(clippy::needless_borrows_for_generic_args)]
-			// `ByRef` covers `T` and `&T`; the borrow is the type hint
-			let sml = simd.splat_real(&sqrt_min_positive());
-			#[allow(clippy::needless_borrows_for_generic_args)]
-			// `ByRef` covers `T` and `&T`; the borrow is the type hint
-			let big = simd.splat_real(&sqrt_max_positive());
+			let (down, up) = range_scales::<T::Real>();
+			let sml = simd.splat_real(down);
+			let big = simd.splat_real(up);
 			let mut acc_sml = [RealReg(simd.zero()); 2];
 			let mut acc_med = [RealReg(simd.zero()); 2];
 			let mut acc_big = [RealReg(simd.zero()); 2];
@@ -82,7 +90,7 @@ fn norm_l2_simd_pairwise_cols<T: ComplexField>(
 		]
 	}
 }
-pub fn norm_l2_x3<T: ComplexField>(mut mat: MatRef<'_, T>) -> [T::Real; 3] {
+fn norm_l2_x3<T: ComplexField>(mut mat: MatRef<'_, T>) -> [T::Real; 3] {
 	if mat.ncols() > 1 && mat.col_stride().unsigned_abs() == 1 {
 		mat = mat.transpose();
 	}
@@ -145,30 +153,31 @@ pub fn norm_l2_x3<T: ComplexField>(mut mat: MatRef<'_, T>) -> [T::Real; 3] {
 				}
 			}
 		}
-		let sml = &sqrt_min_positive::<T::Real>();
-		let big = &sqrt_max_positive::<T::Real>();
-		let mut acc = zero::<T::Real>();
+		let (down, up) = range_scales::<T::Real>();
+		let (mut acc_sml, mut acc_med, mut acc_big) = (zero(), zero(), zero());
+		// A running hypot can round away contributions at subnormal scale.
 		for j in 0..n {
 			for i in 0..m {
-				acc = acc.hypot(mat[(i, j)].abs());
+				let x = &mat[(i, j)];
+				acc_sml = x.mul_pow2(&down).abs2() + acc_sml;
+				acc_med = x.abs2() + acc_med;
+				acc_big = x.mul_pow2(&up).abs2() + acc_big;
 			}
 		}
-		// `acc` is the norm itself, as reference `dnrm2` returns it, so scale before
-		// squaring: squaring the unscaled accumulator overflows or underflows a
-		// norm that is finite and representable.
-		[(sml * &acc).abs2(), acc.abs2(), (big * &acc).abs2()]
+		[acc_sml, acc_med, acc_big]
 	}
 }
 pub fn norm_l2<T: ComplexField>(mat: MatRef<'_, T>) -> T::Real {
 	let [acc_sml, acc_med, acc_big] = norm_l2_x3(mat);
-	let sml = sqrt_min_positive::<T::Real>();
-	let big = sqrt_max_positive::<T::Real>();
-	if acc_sml >= one() {
-		acc_sml.sqrt() * big
-	} else if acc_med >= one() {
+	let (down, up) = range_scales::<T::Real>();
+	// Select while the unscaled sum is still far from the square's range limits.
+	if acc_med < sqrt_min_positive() {
+		acc_big.sqrt() * down
+	} else if acc_med < sqrt_max_positive() {
 		acc_med.sqrt()
 	} else {
-		acc_big.sqrt() * sml
+		// The scaled-down sum also propagates NaN, which compares false above.
+		acc_sml.sqrt() * up
 	}
 }
 #[cfg(test)]
@@ -202,8 +211,7 @@ mod tests {
 	}
 	#[test]
 	fn test_norm_l2_strided_range() {
-		// the generic-stride fallback must square a scaled accumulator, at both ends of
-		// each dtype's exponent range (the range sums it forms are dtype-sized)
+		// Check unequal magnitudes on the generic-stride path.
 		fn check<T: ComplexField>(scales: [f64; 3], tol: f64) {
 			for s in scales {
 				let mat = Mat::<T>::from_fn(2, 2, |i, j| match (i, j) {
@@ -226,6 +234,56 @@ mod tests {
 		check::<c32>(narrow, 1e-5);
 		check::<f64>(wide, 1e-14);
 		check::<c64>(wide, 1e-14);
+	}
+	#[test]
+	fn test_norm_l2_extreme_range() {
+		fn check<T: ComplexField>(
+			make: impl Fn(f64) -> T,
+			max: f64,
+			min_subnormal: f64,
+			sqrt_max_positive: f64,
+		) {
+			for (n, x, expected) in [
+				(1, 0.5 * max, 0.5 * max),
+				(1, 0.75 * max, 0.75 * max),
+				(4, 0.375 * max, 0.75 * max),
+				(4, sqrt_max_positive, 2.0 * sqrt_max_positive),
+				(1, min_subnormal, min_subnormal),
+				(16, min_subnormal, 4.0 * min_subnormal),
+				(16, 10_000.0 * min_subnormal, 40_000.0 * min_subnormal),
+				(256, min_subnormal, 16.0 * min_subnormal),
+				(4, 0.75 * max, f64::INFINITY),
+				(4, f64::INFINITY, f64::INFINITY),
+			] {
+				let contiguous = Col::from_fn(n, |_| make(x));
+				let strided = Mat::from_fn(2, n, |i, _| {
+					if i == 0 { make(x) } else { make(f64::NAN) }
+				});
+				let expected = from_f64::<T::Real>(expected);
+				for (layout, got) in [
+					("contiguous", contiguous.norm_l2()),
+					("strided", strided.row(0).norm_l2()),
+				] {
+					assert_eq!(got, expected, "{layout}, {n} copies of {x:e}");
+				}
+			}
+
+			// NaN takes precedence over infinity, including in the imaginary part.
+			let a = Mat::from_fn(2, 2, |i, j| {
+				make(if i == j { f64::NAN } else { f64::INFINITY })
+			});
+			assert!(a.norm_l2().is_nan());
+			assert!(a.row(0).norm_l2().is_nan());
+		}
+
+		let max32 = f32::MAX as f64;
+		let min32 = f32::from_bits(1) as f64;
+		let bound32 = 2.0f64.powi(63);
+		check(|x| x as f32, max32, min32, bound32);
+		check(|x| c32::new(0.0, x as f32), max32, min32, bound32);
+		let bound64 = 2.0f64.powi(511);
+		check(|x| x, f64::MAX, f64::from_bits(1), bound64);
+		check(|x| c64::new(0.0, x), f64::MAX, f64::from_bits(1), bound64);
 	}
 	#[test]
 	fn test_norm_l2_cplx() {
