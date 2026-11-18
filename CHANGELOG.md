@@ -34,7 +34,7 @@ Numbers are tensor4all/colmat-rs issues or PRs.
 ## Added
 
 - QL and RQ factorizations, `linalg::ql::no_pivoting` and `linalg::rq::no_pivoting` (#60): the
-  packed `ql_in_place` / `rq_in_place` kernels with exact scratch queries, thin and full `Q`, the
+  packed `ql_in_place` / `rq_in_place` kernels with the QR/LQ scratch query for the same shape, thin and full `Q`, the
   compact and full triangular factor with an optional positive diagonal gauge, and `reconstruct`,
   for f32, f64, c32 and c64. They are the QR and LQ kernels run on the view with reversed rows and
   columns, so the packed layouts are those of LAPACK's `?geqlf` and `?gerqf`.

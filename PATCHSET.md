@@ -14,7 +14,8 @@ upstream `faer`.
 ## Pending public API extension
 
 - EXPERIMENT: packed QL and RQ factorizations, `linalg::ql::no_pivoting` and
-  `linalg::rq::no_pivoting` (`_in_place` kernel, exact scratch query, `Par`,
+  `linalg::rq::no_pivoting` (`_in_place` kernel, the QR/LQ scratch query for the
+  same shape, `Par`,
   thin and full `Q`, compact and full triangular factor, optional positive
   diagonal gauge, `reconstruct`; f32/f64/c32/c64)
   ([#60](https://github.com/tensor4all/colmat-rs/issues/60), PR 1; LQ was

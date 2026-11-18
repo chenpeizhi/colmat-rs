@@ -1,13 +1,14 @@
-//! Public contract of the packed QL and RQ factorizations (colmat-rs#60): exact
-//! scratch queries, every output mode into reused buffers, the trapezoidal shape
-//! and the positive gauge of the triangular factor, rank-deficient and graded
-//! inputs, a row-major input and strided outputs, `Par::Seq` against a two-thread
-//! team, and the MatrixFactorizations.jl reference factors
-//! (`fixtures/ql_rq_reference/`).
+//! Public contract of the packed QL and RQ factorizations (colmat-rs#60): runs
+//! at the size of the scratch queries, every output mode into reused buffers, the
+//! trapezoidal shape and the positive gauge of the triangular factor (and the
+//! ungauged factors), the reported rank, rank-deficient and graded inputs, a
+//! row-major input factored in place and strided outputs of every routine,
+//! `Par::Seq` against a two-thread team, and the MatrixFactorizations.jl
+//! reference factors (`fixtures/ql_rq_reference/`).
 use colmat::dyn_stack::{MemBuffer, MemStack};
 use colmat::linalg::{ql, rq};
 use colmat::traits::ComplexField;
-use colmat::{Auto, Mat, Par, ParShape, c32, c64};
+use colmat::{Auto, Mat, MatMut, Par, ParShape, c32, c64};
 mod common;
 use common::*;
 
@@ -15,6 +16,21 @@ fn sample_mat<T: ComplexField>(m: usize, n: usize, seed: f64) -> Mat<T> {
 	Mat::from_fn(m, n, |i, j| {
 		T::from_f64(sample(i, j) + seed * ((i + 2 * j) as f64).sin())
 	})
+}
+
+/// `sample_mat` shifted by 16 on the diagonal that ends in the last row and
+/// column. The plain samples have condition numbers of 1e9-1e11, so two valid
+/// computation orders (a row-major against a column-major input, a team against
+/// `Par::Seq`) agree only to `cond * eps`; this keeps the condition number small
+/// enough for an entry-by-entry comparison at `200 n eps`.
+fn well_conditioned<T: ComplexField>(m: usize, n: usize) -> Mat<T> {
+	let k = Ord::min(m, n);
+	let mut a = sample_mat::<T>(m, n, 0.5);
+	for r in 0..k {
+		let (i, j) = (r + m - k, r + n - k);
+		a[(i, j)] = a[(i, j)].clone() + T::from_f64(16.0);
+	}
+	a
 }
 
 fn block_size<T: ComplexField>(m: usize, n: usize) -> usize {
@@ -43,14 +59,14 @@ fn assert_positive<T: ComplexField>(d: T) {
 	assert!(d.imag().abs() <= bound);
 }
 
-/// QL packed form and coefficients of `a`.
-fn ql_pack<T: ComplexField>(
-	a: MatRef<'_, T>,
+/// Factors `packed` in place as QL; returns the coefficients and the rank.
+fn ql_pack_into<T: ComplexField>(
+	packed: MatMut<'_, T>,
 	block_size: usize,
 	par: Par<'_>,
-) -> (Mat<T>, Mat<T>) {
+) -> (Mat<T>, usize) {
 	use ql::no_pivoting::factor;
-	let (m, n) = a.shape();
+	let (m, n) = packed.shape();
 	let params = <factor::QlParams as Auto<T>>::auto().into();
 	let mut mem = MemBuffer::new(factor::ql_in_place_scratch::<T>(
 		m,
@@ -59,27 +75,26 @@ fn ql_pack<T: ComplexField>(
 		par.shape(),
 		params,
 	));
-	let mut packed = a.to_owned();
 	let mut coeff =
 		Mat::<T>::full(block_size, Ord::min(m, n), T::from_f64(f64::INFINITY));
-	factor::ql_in_place(
-		packed.as_mut(),
+	let info = factor::ql_in_place(
+		packed,
 		coeff.as_mut(),
 		par,
 		MemStack::new(&mut mem),
 		params,
 	);
-	(packed, coeff)
+	(coeff, info.rank)
 }
 
-/// RQ packed form and coefficients of `a`.
-fn rq_pack<T: ComplexField>(
-	a: MatRef<'_, T>,
+/// Factors `packed` in place as RQ; returns the coefficients and the rank.
+fn rq_pack_into<T: ComplexField>(
+	packed: MatMut<'_, T>,
 	block_size: usize,
 	par: Par<'_>,
-) -> (Mat<T>, Mat<T>) {
+) -> (Mat<T>, usize) {
 	use rq::no_pivoting::factor;
-	let (m, n) = a.shape();
+	let (m, n) = packed.shape();
 	let params = <factor::RqParams as Auto<T>>::auto().into();
 	let mut mem = MemBuffer::new(factor::rq_in_place_scratch::<T>(
 		m,
@@ -88,17 +103,38 @@ fn rq_pack<T: ComplexField>(
 		par.shape(),
 		params,
 	));
-	let mut packed = a.to_owned();
 	let mut coeff =
 		Mat::<T>::full(block_size, Ord::min(m, n), T::from_f64(f64::INFINITY));
-	factor::rq_in_place(
-		packed.as_mut(),
+	let info = factor::rq_in_place(
+		packed,
 		coeff.as_mut(),
 		par,
 		MemStack::new(&mut mem),
 		params,
 	);
-	(packed, coeff)
+	(coeff, info.rank)
+}
+
+/// QL packed form, coefficients and rank of `a` (factored in a column-major copy).
+fn ql_pack<T: ComplexField>(
+	a: MatRef<'_, T>,
+	block_size: usize,
+	par: Par<'_>,
+) -> (Mat<T>, Mat<T>, usize) {
+	let mut packed = a.to_owned();
+	let (coeff, rank) = ql_pack_into(packed.as_mut(), block_size, par);
+	(packed, coeff, rank)
+}
+
+/// RQ packed form, coefficients and rank of `a` (factored in a column-major copy).
+fn rq_pack<T: ComplexField>(
+	a: MatRef<'_, T>,
+	block_size: usize,
+	par: Par<'_>,
+) -> (Mat<T>, Mat<T>, usize) {
+	let mut packed = a.to_owned();
+	let (coeff, rank) = rq_pack_into(packed.as_mut(), block_size, par);
+	(packed, coeff, rank)
 }
 
 /// Thin `Q` (`m x k`) and compact `L` (`k x n`) of `a` in the positive gauge.
@@ -107,9 +143,20 @@ fn ql_factors<T: ComplexField>(
 	block_size: usize,
 	mut par: Par<'_>,
 ) -> (Mat<T>, Mat<T>) {
-	let (m, n) = a.shape();
+	let (packed, coeff, _) = ql_pack(a, block_size, par.reborrow());
+	ql_extract(packed.as_ref(), coeff.as_ref(), block_size, par, true)
+}
+
+/// Thin `Q` and compact `L` from a packed QL factorization.
+fn ql_extract<T: ComplexField>(
+	packed: MatRef<'_, T>,
+	coeff: MatRef<'_, T>,
+	block_size: usize,
+	par: Par<'_>,
+	positive: bool,
+) -> (Mat<T>, Mat<T>) {
+	let (m, n) = packed.shape();
 	let k = Ord::min(m, n);
-	let (packed, coeff) = ql_pack(a, block_size, par.reborrow());
 	let mut q = garbage::<T>(m, k);
 	let mut l = garbage::<T>(k, n);
 	let mut mem =
@@ -122,13 +169,13 @@ fn ql_factors<T: ComplexField>(
 		));
 	ql::no_pivoting::unitary::unitary(
 		q.as_mut(),
-		packed.as_ref(),
-		coeff.as_ref(),
-		true,
+		packed,
+		coeff,
+		positive,
 		par,
 		MemStack::new(&mut mem),
 	);
-	ql::no_pivoting::factor::copy_l(l.as_mut(), packed.as_ref(), true);
+	ql::no_pivoting::factor::copy_l(l.as_mut(), packed, positive);
 	(q, l)
 }
 
@@ -138,9 +185,20 @@ fn rq_factors<T: ComplexField>(
 	block_size: usize,
 	mut par: Par<'_>,
 ) -> (Mat<T>, Mat<T>) {
-	let (m, n) = a.shape();
+	let (packed, coeff, _) = rq_pack(a, block_size, par.reborrow());
+	rq_extract(packed.as_ref(), coeff.as_ref(), block_size, par, true)
+}
+
+/// Compact `R` and thin `Q` from a packed RQ factorization.
+fn rq_extract<T: ComplexField>(
+	packed: MatRef<'_, T>,
+	coeff: MatRef<'_, T>,
+	block_size: usize,
+	par: Par<'_>,
+	positive: bool,
+) -> (Mat<T>, Mat<T>) {
+	let (m, n) = packed.shape();
 	let k = Ord::min(m, n);
-	let (packed, coeff) = rq_pack(a, block_size, par.reborrow());
 	let mut r = garbage::<T>(m, k);
 	let mut q = garbage::<T>(k, n);
 	let mut mem =
@@ -153,13 +211,13 @@ fn rq_factors<T: ComplexField>(
 		));
 	rq::no_pivoting::unitary::unitary(
 		q.as_mut(),
-		packed.as_ref(),
-		coeff.as_ref(),
-		true,
+		packed,
+		coeff,
+		positive,
 		par,
 		MemStack::new(&mut mem),
 	);
-	rq::no_pivoting::factor::copy_r(r.as_mut(), packed.as_ref(), true);
+	rq::no_pivoting::factor::copy_r(r.as_mut(), packed, positive);
 	(r, q)
 }
 
@@ -169,8 +227,13 @@ fn ql_contract<T: ComplexField>(a: MatRef<'_, T>) {
 	let (m, n) = a.shape();
 	let k = Ord::min(m, n);
 	let bs = block_size::<T>(m, n);
-	let (packed, coeff) = ql_pack(a, bs, Par::Seq);
+	let (packed, coeff, _) = ql_pack(a, bs, Par::Seq);
 	let (q, l) = ql_factors(a, bs, Par::Seq);
+	// without the gauge: still a factorization with orthonormal columns
+	let (q0, l0) =
+		ql_extract(packed.as_ref(), coeff.as_ref(), bs, Par::Seq, false);
+	close((&q0 * &l0).as_ref(), a);
+	unitary(q0.as_ref());
 	let mut l_full = garbage::<T>(m, n);
 	let mut q_full = garbage::<T>(m, m);
 	let mut rebuilt = garbage::<T>(m, n);
@@ -224,8 +287,13 @@ fn rq_contract<T: ComplexField>(a: MatRef<'_, T>) {
 	let (m, n) = a.shape();
 	let k = Ord::min(m, n);
 	let bs = block_size::<T>(m, n);
-	let (packed, coeff) = rq_pack(a, bs, Par::Seq);
+	let (packed, coeff, _) = rq_pack(a, bs, Par::Seq);
 	let (r, q) = rq_factors(a, bs, Par::Seq);
+	// without the gauge: still a factorization with orthonormal rows
+	let (r0, q0) =
+		rq_extract(packed.as_ref(), coeff.as_ref(), bs, Par::Seq, false);
+	close((&r0 * &q0).as_ref(), a);
+	unitary(q0.transpose());
 	let mut r_full = garbage::<T>(m, n);
 	let mut q_full = garbage::<T>(n, n);
 	let mut rebuilt = garbage::<T>(m, n);
@@ -327,43 +395,155 @@ fn ql_rq_contract() {
 	contracts::<c32>();
 }
 
-/// A row-major input and strided outputs give the column-major factors.
+const GUARD: f64 = 2.5;
+
+/// An `m x n` window at `(1, 2)` of a buffer filled with `GUARD`, so the
+/// window has a column stride larger than `m`.
+fn guarded<T: ComplexField>(m: usize, n: usize) -> Mat<T> {
+	Mat::full(m + 3, n + 2, T::from_f64(GUARD))
+}
+
+/// The window holds `expected` and every entry outside it is still `GUARD`.
+fn check_window<T: ComplexField>(buffer: &Mat<T>, expected: MatRef<'_, T>) {
+	let (m, n) = expected.shape();
+	close(buffer.as_ref().submatrix(1, 2, m, n), expected);
+	for j in 0..buffer.ncols() {
+		for i in 0..buffer.nrows() {
+			let inside = (1..1 + m).contains(&i) && (2..2 + n).contains(&j);
+			if !inside {
+				assert_eq!(
+					buffer[(i, j)],
+					T::from_f64(GUARD),
+					"guard ({i}, {j})"
+				);
+			}
+		}
+	}
+}
+
+/// A row-major input factored in place, and strided outputs of every routine,
+/// give the factors of the column-major path.
 fn views<T: ComplexField>(m: usize, n: usize) {
 	let k = Ord::min(m, n);
 	let bs = block_size::<T>(m, n);
-	let a = sample_mat::<T>(m, n, 0.25);
-	let row_major = a.transpose().to_owned();
+	let a = well_conditioned::<T>(m, n);
+
+	// `storage` is A^T column-major, so its transposed view is A in row-major
+	// layout, and the factorization runs on that layout.
 	let (q, l) = ql_factors(a.as_ref(), bs, Par::Seq);
-	let (q_rm, l_rm) = ql_factors(row_major.transpose(), bs, Par::Seq);
+	let mut storage = a.transpose().to_owned();
+	let (coeff, _) =
+		ql_pack_into(storage.as_mut().transpose_mut(), bs, Par::Seq);
+	let (q_rm, l_rm) =
+		ql_extract(storage.transpose(), coeff.as_ref(), bs, Par::Seq, true);
 	close(q_rm.as_ref(), q.as_ref());
 	close(l_rm.as_ref(), l.as_ref());
 	let (r, qr) = rq_factors(a.as_ref(), bs, Par::Seq);
-	let (r_rm, qr_rm) = rq_factors(row_major.transpose(), bs, Par::Seq);
+	let mut storage = a.transpose().to_owned();
+	let (coeff, _) =
+		rq_pack_into(storage.as_mut().transpose_mut(), bs, Par::Seq);
+	let (r_rm, qr_rm) =
+		rq_extract(storage.transpose(), coeff.as_ref(), bs, Par::Seq, true);
 	close(r_rm.as_ref(), r.as_ref());
 	close(qr_rm.as_ref(), qr.as_ref());
 
-	// strided outputs inside a guarded buffer
-	let (packed, coeff) = ql_pack(a.as_ref(), bs, Par::Seq);
-	let mut wide = Mat::<T>::full(m + 3, k + 2, T::from_f64(2.5));
-	ql::no_pivoting::unitary::unitary(
-		wide.as_mut().submatrix_mut(1, 2, m, k),
-		packed.as_ref(),
-		coeff.as_ref(),
-		true,
-		Par::Seq,
-		MemStack::new(&mut MemBuffer::new(
-			ql::no_pivoting::unitary::unitary_scratch::<T>(
+	// strided outputs inside guarded buffers
+	{
+		use ql::no_pivoting::{factor, reconstruct, unitary};
+		let (packed, coeff, _) = ql_pack(a.as_ref(), bs, Par::Seq);
+		let mut q_out = guarded::<T>(m, k);
+		unitary::unitary(
+			q_out.as_mut().submatrix_mut(1, 2, m, k),
+			packed.as_ref(),
+			coeff.as_ref(),
+			true,
+			Par::Seq,
+			MemStack::new(&mut MemBuffer::new(unitary::unitary_scratch::<T>(
 				m,
 				n,
 				k,
 				bs,
 				ParShape::Seq,
-			),
-		)),
-	);
-	close(wide.as_ref().submatrix(1, 2, m, k), q.as_ref());
-	assert_eq!(wide[(0, 0)], T::from_f64(2.5));
-	assert_eq!(wide[(m + 2, k + 1)], T::from_f64(2.5));
+			))),
+		);
+		check_window(&q_out, q.as_ref());
+		let mut l_out = guarded::<T>(k, n);
+		factor::copy_l(
+			l_out.as_mut().submatrix_mut(1, 2, k, n),
+			packed.as_ref(),
+			true,
+		);
+		check_window(&l_out, l.as_ref());
+		let mut rebuilt = guarded::<T>(m, n);
+		reconstruct::reconstruct(
+			rebuilt.as_mut().submatrix_mut(1, 2, m, n),
+			packed.as_ref(),
+			coeff.as_ref(),
+			Par::Seq,
+			MemStack::new(&mut MemBuffer::new(
+				reconstruct::reconstruct_scratch::<T>(m, n, bs, ParShape::Seq),
+			)),
+		);
+		check_window(&rebuilt, a.as_ref());
+	}
+	{
+		use rq::no_pivoting::{factor, reconstruct, unitary};
+		let (packed, coeff, _) = rq_pack(a.as_ref(), bs, Par::Seq);
+		let mut q_out = guarded::<T>(k, n);
+		unitary::unitary(
+			q_out.as_mut().submatrix_mut(1, 2, k, n),
+			packed.as_ref(),
+			coeff.as_ref(),
+			true,
+			Par::Seq,
+			MemStack::new(&mut MemBuffer::new(unitary::unitary_scratch::<T>(
+				m,
+				n,
+				k,
+				bs,
+				ParShape::Seq,
+			))),
+		);
+		check_window(&q_out, qr.as_ref());
+		let mut r_out = guarded::<T>(m, k);
+		factor::copy_r(
+			r_out.as_mut().submatrix_mut(1, 2, m, k),
+			packed.as_ref(),
+			true,
+		);
+		check_window(&r_out, r.as_ref());
+		let mut rebuilt = guarded::<T>(m, n);
+		reconstruct::reconstruct(
+			rebuilt.as_mut().submatrix_mut(1, 2, m, n),
+			packed.as_ref(),
+			coeff.as_ref(),
+			Par::Seq,
+			MemStack::new(&mut MemBuffer::new(
+				reconstruct::reconstruct_scratch::<T>(m, n, bs, ParShape::Seq),
+			)),
+		);
+		check_window(&rebuilt, a.as_ref());
+	}
+}
+
+/// The reported rank: `min(m, n)` for a full-rank input, 0 for the zero matrix.
+fn ranks<T: ComplexField>(m: usize, n: usize) {
+	let k = Ord::min(m, n);
+	let bs = block_size::<T>(m, n);
+	let a = sample_mat::<T>(m, n, 0.5);
+	assert_eq!(ql_pack(a.as_ref(), bs, Par::Seq).2, k);
+	assert_eq!(rq_pack(a.as_ref(), bs, Par::Seq).2, k);
+	let zero_mat = Mat::<T>::zeros(m, n);
+	assert_eq!(ql_pack(zero_mat.as_ref(), bs, Par::Seq).2, 0);
+	assert_eq!(rq_pack(zero_mat.as_ref(), bs, Par::Seq).2, 0);
+}
+
+#[test]
+fn ql_rq_report_the_rank() {
+	for (m, n) in [(8, 3), (3, 8), (8, 8), (100, 33)] {
+		ranks::<f64>(m, n);
+		ranks::<c64>(m, n);
+	}
 }
 
 #[test]
@@ -378,14 +558,7 @@ fn ql_rq_views() {
 #[test]
 fn ql_rq_parallel_matches_sequential() {
 	fn agree<T: ComplexField>(m: usize, n: usize) {
-		let k = Ord::min(m, n);
-		// shifted on the diagonal that ends in the last row and column, so the
-		// condition number is small and Q is compared entry by entry
-		let mut a = sample_mat::<T>(m, n, 0.5);
-		for r in 0..k {
-			let (i, j) = (r + m - k, r + n - k);
-			a[(i, j)] = a[(i, j)].clone() + T::from_f64(16.0);
-		}
+		let a = well_conditioned::<T>(m, n);
 		let bs = Ord::max(block_size::<T>(m, n) / 2, 1);
 		let (q_seq, l_seq) = ql_factors(a.as_ref(), bs, Par::Seq);
 		let (r_seq, qr_seq) = rq_factors(a.as_ref(), bs, Par::Seq);
