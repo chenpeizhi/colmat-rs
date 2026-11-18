@@ -376,6 +376,13 @@ fn contracts<T: ComplexField>() {
 	for b in [a.as_ref(), a.transpose()] {
 		ql_contract(b);
 		rq_contract(b);
+		// the true rank is 5. The unpivoted kernel's estimate is an upper bound: the
+		// repeated column leaves a rounding-level residual, not an exact zero, so it
+		// reports 6 here (measured for all four dtypes).
+		let bs = block_size::<T>(b.nrows(), b.ncols());
+		for rank in [ql_pack(b, bs, Par::Seq).2, rq_pack(b, bs, Par::Seq).2] {
+			assert!((5..=6).contains(&rank), "rank estimate {rank}");
+		}
 	}
 	// graded rows, twelve orders of magnitude apart
 	let graded = Mat::<T>::from_fn(12, 7, |i, j| {

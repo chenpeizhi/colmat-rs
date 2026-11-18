@@ -12,7 +12,9 @@ use crate::internal_prelude::*;
 /// information about the resulting $RQ$ factorization.
 #[derive(Copy, Clone, Debug)]
 pub struct RqInfo {
-	/// estimated rank of the matrix: the $LQ$ estimate for the reversed view.
+	/// estimated rank of the matrix: the $LQ$ estimate for the reversed view, an
+	/// upper bound on the true rank (without pivoting, a dependent row usually
+	/// leaves a rounding-level residual rather than an exact zero).
 	pub rank: usize,
 }
 /// the recommended block size to use for an $RQ$ decomposition of a matrix with
