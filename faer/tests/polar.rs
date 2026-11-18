@@ -349,6 +349,62 @@ fn polar_rejects_non_finite_input() {
 	rejects::<c32>();
 }
 
+/// Finite entries near the largest finite value: `norm_l2` overflows there, which QDWH must not
+/// turn into $W = 0$, and the hermitian part of $P$ must not overflow either. Checked with $A$
+/// and $P$ divided by the largest entry, so that the products stay finite. QDWH must succeed. The
+/// SVD method inherits the thin SVD, which reports `NoConvergence` at this scale for some shapes;
+/// it must then fail loudly, never return wrong factors.
+#[test]
+fn polar_handles_entries_near_overflow() {
+	fn near_overflow<T: Scalar>(largest: f64) {
+		let big = 0.5 * largest;
+		for (m, n) in [(1, 1), (5, 3), (3, 5), (4, 4)] {
+			let sample = sample_mat::<T>(m, n, 9);
+			let top = (0..m)
+				.flat_map(|i| (0..n).map(move |j| (i, j)))
+				.map(|(i, j)| sample[(i, j)].abs())
+				.fold(zero::<T::Real>(), |a, b| a.fmax(b));
+			// largest entry 1 first, then `big`: `big / top` itself overflows for `top < 1`
+			let unit = Mat::<T>::from_fn(m, n, |i, j| {
+				sample[(i, j)].mul_real(recip(&top))
+			});
+			let scale = from_f64::<T::Real>(big);
+			let a =
+				Mat::<T>::from_fn(m, n, |i, j| unit[(i, j)].mul_real(&scale));
+			for method in METHODS {
+				let tag = format!(
+					"{} {m}x{n} {method:?}",
+					std::any::type_name::<T>()
+				);
+				let (w, p) = match polar(a.as_ref(), method, Par::Seq) {
+					Ok(factors) => factors,
+					Err(PolarError::NoConvergence)
+						if method == PolarMethod::Svd =>
+					{
+						eprintln!("{tag}: thin SVD reports NoConvergence");
+						continue;
+					},
+					Err(e) => panic!("{tag}: {e:?}"),
+				};
+				let p_unit = Mat::<T>::from_fn(p.nrows(), p.ncols(), |i, j| {
+					p[(i, j)].mul_real(recip(&scale))
+				});
+				if m >= n {
+					close((&w * &p_unit).as_ref(), unit.as_ref());
+					unitary(w.as_ref());
+				} else {
+					close((&p_unit * &w).as_ref(), unit.as_ref());
+					unitary(w.transpose());
+				}
+			}
+		}
+	}
+	near_overflow::<f64>(f64::MAX);
+	near_overflow::<c64>(f64::MAX);
+	near_overflow::<f32>(f32::MAX as f64);
+	near_overflow::<c32>(f32::MAX as f64);
+}
+
 /// A row-major input, and outputs that are views into larger buffers (column stride above the row
 /// count) whose other entries stay untouched. `right_polar` also writes through transposed views.
 fn views<T: Scalar>(m: usize, n: usize) {

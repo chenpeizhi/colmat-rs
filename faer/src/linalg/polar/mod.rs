@@ -261,7 +261,11 @@ fn hermitian_part_in_place<T: ComplexField>(P: MatMut<'_, T>) {
 	let half = from_f64::<T::Real>(0.5);
 	for j in 0..P.ncols() {
 		for i in 0..j {
-			let value = mul_real(&add(&P[(i, j)], &conj(&P[(j, i)])), &half);
+			// halve before adding: entries near the largest finite value must not overflow
+			let value = add(
+				&mul_real(&P[(i, j)], &half),
+				&mul_real(&conj(&P[(j, i)]), &half),
+			);
 			P[(j, i)] = conj(&value);
 			P[(i, j)] = value;
 		}
@@ -363,6 +367,7 @@ fn qdwh_polar<T: ComplexField>(
 	// $A = Q R$, so $W = Q W_R$ and $P = P_R$ from the polar decomposition $R = W_R P_R$ of the
 	// $n \times n$ factor
 	let mut W = W;
+	let mut P = P;
 	let mut par = par;
 	let bs = linalg::qr::no_pivoting::factor::recommended_block_size::<T>(m, n);
 	let (mut qr, stack) = unsafe { temp_mat_uninit::<T, _, _>(m, n, stack) };
@@ -371,6 +376,14 @@ fn qdwh_polar<T: ComplexField>(
 		unsafe { temp_mat_uninit::<T, _, _>(bs, n, stack) };
 	let mut householder = householder.as_mat_mut();
 	qr.copy_from(A);
+	// finite entries near the largest finite value overflow the QR's column norms: factor
+	// `eps * A` instead (a power of two, so exact), which leaves $W$ unchanged and scales $P$,
+	// and scale $P$ back at the end
+	let shrink = !is_finite(&qr.norm_l2()) && is_finite(&qr.norm_max());
+	if shrink {
+		let down = eps::<T::Real>();
+		z!(qr.rb_mut()).for_each(|uz!(x)| *x = mul_real(x, &down));
+	}
 	linalg::qr::no_pivoting::factor::qr_in_place(
 		qr.rb_mut(),
 		householder.rb_mut(),
@@ -382,10 +395,14 @@ fn qdwh_polar<T: ComplexField>(
 		qr.rb().subrows(0, n),
 		BlockStructure::TriangularUpper,
 		W.rb_mut().subrows_mut(0, n),
-		P,
+		P.rb_mut(),
 		par.reborrow(),
 		stack,
 	)?;
+	if shrink {
+		let up = recip(&eps::<T::Real>());
+		z!(P.rb_mut()).for_each(|uz!(x)| *x = mul_real(x, &up));
+	}
 	W.rb_mut().subrows_mut(n, m - n).fill(zero());
 	linalg::householder::apply_block_householder_sequence_on_the_left_in_place_with_conj(
 		qr.rb(),
@@ -444,6 +461,14 @@ fn qdwh_iterate<T: ComplexField>(
 		// nonzero matrix with entries near 1e-320: scale by an exact power of two first
 		let up = recip(&eps::<T::Real>());
 		z!(X.rb_mut()).for_each(|uz!(x)| *x = mul_real(x, &up));
+		alpha = X.norm_l2();
+	}
+	if !is_finite(&alpha) && is_finite(&X.norm_max()) {
+		// the overflow twin: finite entries near the largest finite value make `norm_l2`
+		// overflow, and `recip` of infinity would zero $X$ and report a converged $W = 0$.
+		// non-finite entries keep the infinite norm and end in `NoConvergence` below.
+		let down = eps::<T::Real>();
+		z!(X.rb_mut()).for_each(|uz!(x)| *x = mul_real(x, &down));
 		alpha = X.norm_l2();
 	}
 	if alpha == zero() {
