@@ -257,6 +257,13 @@ pub(crate) fn run(
 		return f(0, 1);
 	}
 	stats::hist(&stats::RUN, m);
+	// each participant leaves its share with the upper vector state cleared: a share can end in
+	// a kernel call (the triangle split of the triangular product), and a member goes back to the
+	// wait loop from here (#238)
+	let f = |i: usize, parts: usize| {
+		f(i, parts);
+		end_of_job();
+	};
 	if m == size {
 		team.run(f);
 	} else {
@@ -264,6 +271,19 @@ pub(crate) fn run(
 			child.run(f);
 		});
 	}
+}
+
+/// Called by every participant at the end of its job in a team region (#238): clears the upper
+/// halves of the vector registers ([`clear_upper_vector_state`](crate::utils::simd)). The
+/// `t4a-private-gemm-x86` kernels are assembly that return without `vzeroupper`; a member that
+/// ends a job dirty goes back to `threadteam`'s wait loop, which has no AVX code to clear it, and
+/// runs its next job with every legacy-SSE scalar instruction carrying a false dependency on its
+/// destination's upper bits. One instruction per participant and region, nothing on a
+/// sequential call.
+#[inline]
+pub(crate) fn end_of_job() {
+	#[cfg(all(target_arch = "x86_64", feature = "std"))]
+	crate::utils::simd::clear_upper_vector_state();
 }
 
 /// A flat item loop on the team: the items of `iter` are dealt out in contiguous static blocks
@@ -378,6 +398,7 @@ fn deal<T, P: Producer<Item = T>, F: Sync + for<'c> Fn(T, TeamExec<'c>)>(
 			for item in piece.into_iter() {
 				f(item, child.reborrow());
 			}
+			end_of_job();
 		});
 		return;
 	}
@@ -400,6 +421,7 @@ fn deal<T, P: Producer<Item = T>, F: Sync + for<'c> Fn(T, TeamExec<'c>)>(
 		} else {
 			deal(child, half, len - left_len, jobs - left, f)
 		}
+		end_of_job();
 	})
 	.expect("two non-empty parts within the team");
 }
@@ -528,8 +550,13 @@ pub(crate) mod kernel {
 
 		fn run(&self, f: &(dyn Fn(usize) + Sync)) {
 			stats::hist(&stats::RUN, self.width);
-			// the kernel never re-enters `run`, so the borrow is never contended
-			self.team.borrow_mut().reborrow().run(|j, _| f(j));
+			// the kernel never re-enters `run`, so the borrow is never contended. Each member
+			// leaves the kernel's stage with its upper vector state cleared: it returns to the
+			// team's wait loop, where nothing else would clear it (#238)
+			self.team.borrow_mut().reborrow().run(|j, _| {
+				f(j);
+				super::end_of_job();
+			});
 		}
 	}
 
@@ -3509,5 +3536,78 @@ mod tests {
 			all <= 5,
 			"two calls ran on {all} threads: the second pool spawned new ones"
 		);
+	}
+
+	/// A team's members start every job with the upper halves of their vector registers in their
+	/// initial state (#238): after a team product on the x86 kernel, and after a job that ended in a
+	/// sequential one. The kernel is hand-written assembly that returns without `vzeroupper`; a
+	/// member that went back to the wait loop dirty would run its next job with legacy-SSE scalar
+	/// code carrying a false dependency per instruction. `XGETBV(1)` reads which
+	/// state components are in use: bit 2 (`YMM_Hi128`) and bit 6 (`ZMM_Hi256`) are the two
+	/// `vzeroupper` returns to their initial state.
+	#[cfg(target_arch = "x86_64")]
+	#[test]
+	fn members_start_jobs_with_clean_upper_vector_state() {
+		use core::arch::x86_64::{__cpuid_count, _xgetbv};
+		// XGETBV with ECX = 1 needs CPUID.(EAX = 0DH, ECX = 1):EAX[2]
+		let xgetbv1 = (__cpuid_count(0xd, 1).eax & (1 << 2)) != 0;
+		if kernel::available::<f64>().is_none() || !xgetbv1 {
+			return;
+		}
+		#[target_feature(enable = "xsave")]
+		unsafe fn in_use() -> u64 {
+			// SAFETY: the caller checked `XGETBV(1)`
+			unsafe { _xgetbv(1) }
+		}
+		const UPPER: u64 = (1 << 2) | (1 << 6);
+		let dirty_members = |par: Par<'_>| {
+			let Par::Team(mut team) = par else {
+				unreachable!("a width of 4 is a team")
+			};
+			let dirty = AtomicUsize::new(0);
+			team.reborrow().run(|_, _| {
+				// SAFETY: `XGETBV(1)` was checked above, and it implies XSAVE
+				if unsafe { in_use() } & UPPER != 0 {
+					dirty.fetch_add(1, Ordering::Relaxed);
+				}
+			});
+			dirty.into_inner()
+		};
+		let n = 384;
+		let a = Mat::<f64>::from_fn(n, n, |i, j| ((i + 2 * j) % 7) as f64);
+		let b = a.transpose().to_owned();
+		let mut c = Mat::<f64>::zeros(n, n);
+		let (_, st) = counted(4, |mut par| {
+			for _ in 0..3 {
+				matmul(
+					c.as_mut(),
+					Accum::Replace,
+					a.as_ref(),
+					b.as_ref(),
+					1.0,
+					par.reborrow(),
+				);
+				assert_eq!(dirty_members(par.reborrow()), 0);
+			}
+			// a job of the library's own dispatch that ends in a sequential product
+			let m = 96;
+			let Par::Team(team) = par.reborrow() else {
+				unreachable!("a width of 4 is a team")
+			};
+			run(team, 4, &|_, _| {
+				let mut c = Mat::<f64>::zeros(m, m);
+				matmul(
+					c.as_mut(),
+					Accum::Replace,
+					a.as_ref().submatrix(0, 0, m, m),
+					b.as_ref().submatrix(0, 0, m, m),
+					1.0,
+					Par::Seq,
+				);
+				core::hint::black_box(&c);
+			});
+			assert_eq!(dirty_members(par.reborrow()), 0);
+		});
+		assert!(st.gemm_team_kernel >= 1, "{st:?}");
 	}
 }
