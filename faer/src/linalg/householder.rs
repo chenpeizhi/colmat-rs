@@ -56,19 +56,50 @@ pub struct HouseholderInfo<T: ComplexField> {
 /// $x$ is determined by $x_0$, contained in `head`, and $|x_{1\dots}|$,
 /// contained in `tail_norm`. the vector $v$ is such that $v_0 = 1$ and
 /// $v_{1\dots}$ is stored in `essential` (when provided)
-fn make_householder_imp<T: ComplexField>(
+fn make_householder_imp<T: ComplexField, const PRESERVE_TINY: bool>(
 	head: &mut T,
-	out: ColMut<'_, T>,
-	input: Option<ColRef<'_, T>>,
+	mut out: ColMut<'_, T>,
+	mut input: Option<ColRef<'_, T>>,
 ) -> HouseholderInfo<T> {
 	let tail = input.unwrap_or(out.rb());
-	let tail_norm = tail.norm_l2();
+	let mut tail_norm = tail.norm_l2();
 	let mut head_norm = (*head).abs();
-	if head_norm < min_positive() {
+	let min = min_positive::<T::Real>();
+	let scales = if PRESERVE_TINY {
+		let safmin = &min / eps::<T::Real>();
+		// As in LAPACK xLARFG, lift a tiny reflector before forming its ratios.
+		// Check the entries if the initial norm rounded to zero.
+		if head_norm < safmin
+			&& tail_norm < safmin
+			&& (tail_norm != zero() || tail.iter().any(|x| *x != zero()))
+		{
+			Some((safmin.recip(), safmin))
+		} else {
+			None
+		}
+	} else {
+		None
+	};
+	if let Some((scale, _)) = &scales {
+		*head = head.mul_pow2(scale);
+		match input.take() {
+			None => zip!(out.rb_mut()).for_each(|unzip!(x)| {
+				*x = x.mul_pow2(scale);
+			}),
+			Some(input) => {
+				zip!(out.rb_mut(), input).for_each(|unzip!(o, x)| {
+					*o = x.mul_pow2(scale);
+				})
+			},
+		}
+		head_norm = (*head).abs();
+		tail_norm = out.norm_l2();
+	}
+	if head_norm < min && !(PRESERVE_TINY && tail_norm < min) {
 		*head = zero();
 		head_norm = zero();
 	}
-	if tail_norm < min_positive() {
+	if tail_norm < min {
 		return HouseholderInfo {
 			tau: infinity(),
 			head_with_beta_inv: infinity(),
@@ -99,6 +130,14 @@ fn make_householder_imp<T: ComplexField>(
 	*head = -signed_norm;
 	let tau = one_half
 		* (one::<T::Real>() + (tail_norm * head_with_beta_inv.abs()).abs2());
+	if let Some((scale, safmin)) = scales {
+		*head = head.mul_pow2(&safmin);
+		return HouseholderInfo {
+			tau,
+			head_with_beta_inv: head_with_beta_inv.mul_pow2(scale),
+			norm: norm * safmin,
+		};
+	}
 	HouseholderInfo {
 		tau,
 		head_with_beta_inv,
@@ -118,15 +157,18 @@ pub fn make_householder_in_place<T: ComplexField>(
 	head: &mut T,
 	tail: ColMut<'_, T>,
 ) -> HouseholderInfo<T> {
-	make_householder_imp(head, tail, None)
+	make_householder_imp::<T, false>(head, tail, None)
 }
+
+// QR consumes the normalized reflector and tau, not the original-scale
+// inverse, which the fused SVD bidiagonalization needs to be representable.
 #[inline]
-pub(crate) fn make_householder_out_of_place<T: ComplexField>(
+pub(super) fn make_qr_householder<T: ComplexField>(
 	head: &mut T,
 	out: ColMut<'_, T>,
-	tail: ColRef<'_, T>,
+	input: Option<ColRef<'_, T>>,
 ) -> HouseholderInfo<T> {
-	make_householder_imp(head, out, Some(tail))
+	make_householder_imp::<T, true>(head, out, input)
 }
 #[doc(hidden)]
 /// bases up to this width have their `V^H V` formed as inner products on the calling thread
@@ -1160,6 +1202,37 @@ mod tests {
 	use crate::{Conj, Mat, Par};
 	use num_complex::ComplexFloat;
 	use reborrow::ReborrowMut;
+
+	#[test]
+	fn tiny_householder_keeps_its_reflector() {
+		use super::make_qr_householder;
+		use crate::Col;
+
+		let ordinary_tail = Col::from_fn(2, |i| [4.0f64, -8.0][i]);
+		let mut expected = ordinary_tail.clone();
+		let normal = make_householder_in_place(&mut 3.0, expected.as_mut());
+		for scale in [f64::MIN_POSITIVE / 16.0, f64::from_bits(1)] {
+			let input = Col::from_fn(2, |i| ordinary_tail[i] * scale);
+			let mut out = Col::zeros(2);
+			let mut head = 3.0 * scale;
+			let info = make_qr_householder(
+				&mut head,
+				out.as_mut(),
+				Some(input.as_ref()),
+			);
+			assert!((info.tau - normal.tau).abs() < 4.0 * f64::EPSILON);
+			assert!(head < 0.0 && info.norm > 0.0);
+			for i in 0..2 {
+				assert!((out[i] - expected[i]).abs() < 4.0 * f64::EPSILON);
+				assert_eq!(input[i], ordinary_tail[i] * scale);
+			}
+		}
+		let mut head = f64::from_bits(1);
+		let mut tail = Col::<f64>::zeros(2);
+		let info = make_qr_householder(&mut head, tail.as_mut(), None);
+		assert_eq!(head, f64::from_bits(1));
+		assert_eq!(info.tau, f64::INFINITY);
+	}
 
 	/// The `N == 1` kernel is one sequential rank-one update per target column, and it is skipped in
 	/// favour of the generic path -- which partitions the columns and threads its products -- when

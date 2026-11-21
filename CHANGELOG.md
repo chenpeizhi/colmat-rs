@@ -4,11 +4,25 @@ Numbers are tensor4all/colmat-rs issues or PRs.
 
 ## Correctness
 
+- `norm_l2` no longer returns infinity or zero for representable norms at the
+  ends of the floating-point range (#229). The SIMD path widens its scaling
+  factors, and strided views scale entries before summing squares.
+- The positive-diagonal gauge of QR and LQ (`positive_phase`) returned `inf` or a wrong phase for a
+  diagonal entry near underflow, because `1 / |d|` overflows there. Since #228 keeps tiny
+  reflectors, a rank-deficient `f32`/`c32` LQ (and QR) with the positive gauge produced a
+  non-finite `Q` row; the nightly LAPACK `lq` family failed on its `kind=4` case (#246). The phase
+  is now formed after an exact power-of-two lift, so it is scale-free.
+- `scripts/summarize-lapack-failures.py` wrote one `family: test` line per failure to
+  `$GITHUB_OUTPUT`, which GitHub rejects past the first line, so the summary of a night with
+  several unexpected failures was lost. It now writes the multiline `name<<DELIMITER` form (#246).
 - A `Par::Team` holding a team of one participant took the kernels' parallel branches with one
   thread instead of running sequentially: `utils::thread::with_width` returned it unchanged
   before checking for a width below two. An `n x 1` product then kept an `n`-element partial
   buffer per thread and added it back (#168). `with_width` now maps a width or a degree below two to
   `Par::Seq` first. Covered by `team_of_one`.
+- QR now forms tiny Householder reflectors at a safe scale instead of dropping
+  subnormal heads or tails. It restores the original scale in the diagonal and
+  retains the reflector and tau (#228).
 - A dense product of `fx128` or `cx128` matrices panicked in every build except the crate's own unit
   tests. The SIMD micro-kernels that `matmul` routes non-native scalars to refused them unless
   `cfg!(test)` was set, so the in-crate tests took a path no user build takes (#174). The kernels now
@@ -30,6 +44,9 @@ Numbers are tensor4all/colmat-rs issues or PRs.
   `n x nblock`, and `nblock` exceeds `2 nsr` for small shift counts. With the exact queried
   workspace, complex QZ panicked at n = 15..20 with two shifts. The sweep now reserves `n x
   max(2 nsr, nblock)`.
+- Dense SVD now scales inputs near the floating-point range limits before QR
+  or bidiagonalization, restoring the original scale in the returned singular
+  values (#227).
 
 ## Added
 

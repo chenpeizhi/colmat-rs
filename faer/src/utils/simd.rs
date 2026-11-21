@@ -534,3 +534,32 @@ impl<'N, T: ComplexField, S: Simd> Clone for SimdTail<'N, T, S> {
 		*self
 	}
 }
+
+/// Clears the upper halves of the vector registers of the calling thread (`vzeroupper`, when AVX
+/// is present). Called by every participant of a team region at the end of its job
+/// ([`team::end_of_job`](crate::utils::team)), never on a sequential call (tensor4all/colmat-rs#238).
+///
+/// The `t4a-private-gemm-x86` kernels are hand-written assembly that use `ymm`/`zmm` registers and
+/// return without `vzeroupper`. A thread that goes on in compiled code is cleaned as a side effect,
+/// since compiled code issues `vzeroupper` when it leaves an AVX function; a team member goes back
+/// to `threadteam`'s wait loop, which has no AVX code, and runs its next job dirty. In that state
+/// every legacy-SSE scalar instruction (the default x86-64 target compiles scalar `f64` arithmetic
+/// to them) carries a false dependency on its destination's upper bits, which serialises
+/// independent operations: the secular-equation root loop of the tridiagonal divide and conquer
+/// ran 3.7 times slower on a member than on the leader (Zen 5, f64 n = 512), while a dependent
+/// chain of divisions ran at the same speed on both
+/// (`docs/worklogs/2026-11-19-eigh-dirty-upper-state.md`). Clearing after every sequential kernel
+/// call instead made sequential small factorisations up to 1.24 times slower on the same host.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[inline]
+pub(crate) fn clear_upper_vector_state() {
+	#[target_feature(enable = "avx")]
+	unsafe fn vzeroupper() {
+		core::arch::x86_64::_mm256_zeroupper()
+	}
+	// the kernels run only where AVX2 or AVX-512F was detected, so this is always taken after one
+	if std::arch::is_x86_feature_detected!("avx") {
+		// SAFETY: AVX was detected
+		unsafe { vzeroupper() }
+	}
+}
