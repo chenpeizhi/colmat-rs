@@ -352,8 +352,8 @@ fn polar_rejects_non_finite_input() {
 /// Finite entries near the largest finite value: `norm_l2` overflows there, which QDWH must not
 /// turn into $W = 0$, and the hermitian part of $P$ must not overflow either. Checked with $A$
 /// and $P$ divided by the largest entry, so that the products stay finite. QDWH must succeed. The
-/// SVD method inherits the thin SVD, which reports `NoConvergence` at this scale for some shapes;
-/// it must then fail loudly, never return wrong factors.
+/// SVD method must succeed unless the largest singular value of $A$ exceeds the largest finite
+/// value (the complex cases, 1.09 to 1.21 times it), where the thin SVD reports `NoConvergence`.
 #[test]
 fn polar_handles_entries_near_overflow() {
 	fn near_overflow<T: Scalar>(largest: f64) {
@@ -368,6 +368,12 @@ fn polar_handles_entries_near_overflow() {
 			let unit = Mat::<T>::from_fn(m, n, |i, j| {
 				sample[(i, j)].mul_real(recip(&top))
 			});
+			// $\sigma_{\max}(A) = \sigma_{\max}(\text{unit}) \cdot 0.5 \cdot \text{largest}$
+			let sigma_overflows = unit
+				.singular_values(Par::Seq)
+				.unwrap()
+				.iter()
+				.any(|s| s.mul_real(from_f64::<T::Real>(0.5)) > one());
 			let scale = from_f64::<T::Real>(big);
 			let a =
 				Mat::<T>::from_fn(m, n, |i, j| unit[(i, j)].mul_real(&scale));
@@ -379,9 +385,8 @@ fn polar_handles_entries_near_overflow() {
 				let (w, p) = match polar(a.as_ref(), method, Par::Seq) {
 					Ok(factors) => factors,
 					Err(PolarError::NoConvergence)
-						if method == PolarMethod::Svd =>
+						if method == PolarMethod::Svd && sigma_overflows =>
 					{
-						eprintln!("{tag}: thin SVD reports NoConvergence");
 						continue;
 					},
 					Err(e) => panic!("{tag}: {e:?}"),
@@ -403,6 +408,31 @@ fn polar_handles_entries_near_overflow() {
 	near_overflow::<c64>(f64::MAX);
 	near_overflow::<f32>(f32::MAX as f64);
 	near_overflow::<c32>(f32::MAX as f64);
+}
+
+/// Finite entries whose $P$ is not representable: every entry $0.9 \cdot$ MAX gives entries of
+/// $P$ of $1.35 \cdot$ MAX on 3 x 2 and 2 x 3, where QDWH returned `Ok` with an infinite $P$.
+/// Either method may refuse such input, but must not return a non-finite factor.
+#[test]
+fn polar_never_returns_non_finite_factors() {
+	fn run<T: Scalar>(largest: f64) {
+		for (m, n) in [(2, 2), (3, 2), (2, 3)] {
+			let a = Mat::<T>::full(m, n, T::from_f64(0.9 * largest));
+			for method in METHODS {
+				if let Ok((w, p)) = polar(a.as_ref(), method, Par::Seq) {
+					assert!(
+						is_finite(&w.norm_max()) && is_finite(&p.norm_max()),
+						"{} {m}x{n} {method:?}",
+						std::any::type_name::<T>()
+					);
+				}
+			}
+		}
+	}
+	run::<f64>(f64::MAX);
+	run::<c64>(f64::MAX);
+	run::<f32>(f32::MAX as f64);
+	run::<c32>(f32::MAX as f64);
 }
 
 /// A row-major input, and outputs that are views into larger buffers (column stride above the row

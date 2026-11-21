@@ -63,8 +63,10 @@ pub enum PolarMethod {
 /// polar decomposition error
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PolarError {
-	/// the SVD did not converge, or the QDWH iteration did not meet its stopping rule within its
-	/// iteration limit (only seen with non-finite entries)
+	/// the SVD did not converge, the QDWH iteration did not meet its stopping rule within its
+	/// iteration limit, or $P$ is not representable. reached with non-finite input, or with finite
+	/// input whose $P$ (either method) or largest singular value (the SVD method) is not
+	/// representable in `T`
 	NoConvergence,
 }
 
@@ -158,10 +160,16 @@ pub fn left_polar<T: ComplexField>(
 		P.nrows() == n,
 		P.ncols() == n,
 	));
+	let mut P = P;
 	match params.config.method {
-		PolarMethod::Svd => svd_polar(A, W, P, par, stack),
-		PolarMethod::Qdwh => qdwh_polar(A, W, P, par, stack),
+		PolarMethod::Svd => svd_polar(A, W, P.rb_mut(), par, stack),
+		PolarMethod::Qdwh => qdwh_polar(A, W, P.rb_mut(), par, stack),
+	}?;
+	// finite input can still have a $P$ beyond the largest finite value (QDWH scales it back up)
+	if !is_finite(&P.norm_max()) {
+		return Err(PolarError::NoConvergence);
 	}
+	Ok(())
 }
 
 /// computes the right polar decomposition $A = P W^H$ of an $m \times n$ matrix, $m \le n$.
