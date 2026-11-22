@@ -12,8 +12,9 @@ use crate::internal_prelude::*;
 #[derive(Copy, Clone, Debug)]
 pub struct QlInfo {
 	/// estimated rank of the matrix: the $QR$ kernel's estimate for the reversed
-	/// view, an upper bound on the true rank (without pivoting, a dependent column
-	/// usually leaves a rounding-level residual rather than an exact zero).
+	/// view, the number of columns whose residual after the previous reflectors is
+	/// not exactly zero. without pivoting, a dependent column usually leaves a
+	/// rounding-level residual and is counted, so this is not rank-revealing.
 	pub rank: usize,
 }
 /// the recommended block size to use for a $QL$ decomposition of a matrix with

@@ -376,10 +376,10 @@ fn contracts<T: ComplexField>() {
 	for b in [a.as_ref(), a.transpose()] {
 		ql_contract(b);
 		rq_contract(b);
-		// the true rank is 5. The unpivoted kernel's estimate is an upper bound: the
-		// repeated column leaves a rounding-level residual, not an exact zero, so it
-		// reports 6 here (all four dtypes, Linux x86_64). 5 would be exact, not a
-		// regression, so the test asserts only the bound: at least 5 of 6 columns.
+		// the true rank is 5. The estimate counts columns with a nonzero residual, and
+		// the repeated column leaves a rounding-level one, so it reports 6 here (all
+		// four dtypes, Linux x86_64). 5 would be exact, not a regression, so the test
+		// asserts only that the dependency does not hide an independent column.
 		let bs = block_size::<T>(b.nrows(), b.ncols());
 		for rank in [ql_pack(b, bs, Par::Seq).2, rq_pack(b, bs, Par::Seq).2] {
 			assert!((5..=6).contains(&rank), "rank estimate {rank}");
@@ -392,6 +392,11 @@ fn contracts<T: ComplexField>() {
 	for b in [graded.as_ref(), graded.transpose()] {
 		ql_contract(b);
 		rq_contract(b);
+		// full rank 7, with the smallest rows below `eps` in `f32`: no independent column
+		// may end with an exactly zero residual
+		let bs = block_size::<T>(b.nrows(), b.ncols());
+		assert_eq!(ql_pack(b, bs, Par::Seq).2, 7);
+		assert_eq!(rq_pack(b, bs, Par::Seq).2, 7);
 	}
 }
 
@@ -556,9 +561,18 @@ fn ql_rq_report_the_rank() {
 
 #[test]
 fn ql_rq_views() {
-	// 200 x 100 (and its transpose) is past `row_major_copy_pays`, so the reversed row-major
-	// view takes the QR's copy-to-column-major path
-	for (m, n) in [(8, 3), (3, 8), (8, 8), (100, 33), (200, 100), (100, 200)] {
+	// past `row_major_copy_pays`, QL's reversed row-major view takes QR's copy to column major
+	// when tall (200 x 100) and the LQ transpose dual when square below 192 (100 x 100) at
+	// `Par::Seq`; 100 x 200 is wide, so it factors on the reversed strides
+	for (m, n) in [
+		(8, 3),
+		(3, 8),
+		(8, 8),
+		(100, 33),
+		(200, 100),
+		(100, 100),
+		(100, 200),
+	] {
 		views::<f64>(m, n);
 		views::<c64>(m, n);
 	}

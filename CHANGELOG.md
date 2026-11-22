@@ -67,9 +67,6 @@ Numbers are tensor4all/colmat-rs issues or PRs.
   `right_polar` (`A = P W^H`, `m <= n`) with the conventions of MatrixAlgebraKit.jl, exact
   scratch queries and `Par`, for f32, f64, c32 and c64. `PolarParams::method` selects the thin
   SVD (the default) or QDWH, which uses only column-pivoted QR, Cholesky and matrix products.
-
-## Added
-
 - QL and RQ factorizations, `linalg::ql::no_pivoting` and `linalg::rq::no_pivoting` (#60): the
   packed `ql_in_place` / `rq_in_place` kernels with the QR/LQ scratch query for the same shape, thin and full `Q`, the
   compact and full triangular factor with an optional positive diagonal gauge, and `reconstruct`,
