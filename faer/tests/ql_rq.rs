@@ -378,7 +378,8 @@ fn contracts<T: ComplexField>() {
 		rq_contract(b);
 		// the true rank is 5. The unpivoted kernel's estimate is an upper bound: the
 		// repeated column leaves a rounding-level residual, not an exact zero, so it
-		// reports 6 here (measured for all four dtypes).
+		// reports 6 here (all four dtypes, Linux x86_64). 5 would be exact, not a
+		// regression, so the test asserts only the bound: at least 5 of 6 columns.
 		let bs = block_size::<T>(b.nrows(), b.ncols());
 		for rank in [ql_pack(b, bs, Par::Seq).2, rq_pack(b, bs, Par::Seq).2] {
 			assert!((5..=6).contains(&rank), "rank estimate {rank}");
@@ -555,7 +556,9 @@ fn ql_rq_report_the_rank() {
 
 #[test]
 fn ql_rq_views() {
-	for (m, n) in [(8, 3), (3, 8), (8, 8), (100, 33)] {
+	// 200 x 100 (and its transpose) is past `row_major_copy_pays`, so the reversed row-major
+	// view takes the QR's copy-to-column-major path
+	for (m, n) in [(8, 3), (3, 8), (8, 8), (100, 33), (200, 100), (100, 200)] {
 		views::<f64>(m, n);
 		views::<c64>(m, n);
 	}

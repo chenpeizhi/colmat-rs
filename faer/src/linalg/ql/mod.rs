@@ -11,7 +11,8 @@
 //! reversal: $A = (P_m \tilde Q P_m)(P_m \tilde R P_n)$. `factor::ql_in_place`
 //! runs the blocked $QR$ kernel on `A.reverse_rows_and_cols_mut()`, so $L$ lands
 //! on and below the diagonal of $A$ that ends in its last row and column, and the
-//! householder vectors above it, the storage layout of LAPACK's `?geqlf`. `unitary` builds $Q$ (thin
+//! householder vectors above it, where LAPACK's `?geqlf` puts them (the coefficients are faer's
+//! block form, not LAPACK's `tau`). `unitary` builds $Q$ (thin
 //! or full), `reconstruct` rebuilds $A = QL$, and `factor::copy_l` copies $L$
 //! out.
 pub mod no_pivoting;

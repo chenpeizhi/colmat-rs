@@ -12,6 +12,7 @@
 //! runs [`lq_in_place`](crate::linalg::lq::no_pivoting::factor::lq_in_place) on
 //! `A.reverse_rows_and_cols_mut()`, so $R$ lands on and above the diagonal of $A$
 //! that ends in its last row and column, and the householder vectors of $Q$
-//! below it, the storage layout of LAPACK's `?gerqf`. `unitary` builds $Q$ (thin or
+//! below it, where LAPACK's `?gerqf` puts them (the coefficients are faer's block form, not
+//! LAPACK's `tau`). `unitary` builds $Q$ (thin or
 //! full), `reconstruct` rebuilds $A = RQ$, and `factor::copy_r` copies $R$ out.
 pub mod no_pivoting;
