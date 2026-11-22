@@ -13,6 +13,18 @@ upstream `faer`.
 
 ## Pending public API extension
 
+- EXPERIMENT: packed QL and RQ factorizations, `linalg::ql::no_pivoting` and
+  `linalg::rq::no_pivoting` (`_in_place` kernel, the QR/LQ scratch query for the
+  same shape, `Par`,
+  thin and full `Q`, compact and full triangular factor, optional positive
+  diagonal gauge, `reconstruct`; f32/f64/c32/c64)
+  ([#60](https://github.com/tensor4all/colmat-rs/issues/60), PR 1; LQ was
+  already carried). QL is the blocked QR kernel on the view with reversed rows
+  and columns, RQ the LQ entry on the same view, so no new arithmetic; `L`/`R`
+  sit where LAPACK's `?geqlf`/`?gerqf` put them, but `Q` is in faer's
+  block-reflector form, not LAPACK's `tau`; no performance claim.
+  [Design and verification scope](docs/worklogs/2026-11-17-ql-rq.md).
+
 - EXPERIMENT: polar decomposition, `linalg::polar` (`left_polar`, `A = W P` for
   `m >= n`; `right_polar`, `A = P W^H` for `m <= n`; MatrixAlgebraKit.jl
   conventions; explicit outputs, exact scratch queries, `Par`; f32/f64/c32/c64)
