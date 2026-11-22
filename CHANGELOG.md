@@ -2,13 +2,40 @@
 
 Numbers are tensor4all/colmat-rs issues or PRs.
 
+## Performance
+
+- Small QR factorizations take a level-2 path: below `128 x 128` elements (a quarter of that for a
+  complex type on a team; at most 32 columns per row) a column-major `qr_in_place` applies one
+  reflector at a time, two per sweep, with a SIMD kernel over four target columns, and forms the
+  block factors of `H` afterwards (#269). `compute_thin_Q` up to `96 x 96` and
+  `apply_block_householder_sequence_on_the_left_in_place_with_conj` on targets up to `32 x 32`
+  use the matching sweep. f64 on evo against AOCL 6.0.0: `qr_factor` 32 from 16.7 us to 8.2
+  (AOCL 7.5), 64 from 67.9 to 30.2 (40.7); `qr` (factor + thin Q) 32 from 28.2 to 16.3 (15.9).
+  Below those sizes the results are no longer bitwise identical to 0.34.0 (they remain
+  deterministic at a fixed thread count). No API change, no allocation.
+  [Isolation and limits](docs/worklogs/2026-11-22-small-qr-level2.md).
+
 ## Correctness
 
+- `norm_l2` no longer returns infinity or zero for representable norms at the
+  ends of the floating-point range (#229). The SIMD path widens its scaling
+  factors, and strided views scale entries before summing squares.
+- The positive-diagonal gauge of QR and LQ (`positive_phase`) returned `inf` or a wrong phase for a
+  diagonal entry near underflow, because `1 / |d|` overflows there. Since #228 keeps tiny
+  reflectors, a rank-deficient `f32`/`c32` LQ (and QR) with the positive gauge produced a
+  non-finite `Q` row; the nightly LAPACK `lq` family failed on its `kind=4` case (#246). The phase
+  is now formed after an exact power-of-two lift, so it is scale-free.
+- `scripts/summarize-lapack-failures.py` wrote one `family: test` line per failure to
+  `$GITHUB_OUTPUT`, which GitHub rejects past the first line, so the summary of a night with
+  several unexpected failures was lost. It now writes the multiline `name<<DELIMITER` form (#246).
 - A `Par::Team` holding a team of one participant took the kernels' parallel branches with one
   thread instead of running sequentially: `utils::thread::with_width` returned it unchanged
   before checking for a width below two. An `n x 1` product then kept an `n`-element partial
   buffer per thread and added it back (#168). `with_width` now maps a width or a degree below two to
   `Par::Seq` first. Covered by `team_of_one`.
+- QR now forms tiny Householder reflectors at a safe scale instead of dropping
+  subnormal heads or tails. It restores the original scale in the diagonal and
+  retains the reflector and tau (#228).
 - A dense product of `fx128` or `cx128` matrices panicked in every build except the crate's own unit
   tests. The SIMD micro-kernels that `matmul` routes non-native scalars to refused them unless
   `cfg!(test)` was set, so the in-crate tests took a path no user build takes (#174). The kernels now
@@ -30,6 +57,16 @@ Numbers are tensor4all/colmat-rs issues or PRs.
   `n x nblock`, and `nblock` exceeds `2 nsr` for small shift counts. With the exact queried
   workspace, complex QZ panicked at n = 15..20 with two shifts. The sweep now reserves `n x
   max(2 nsr, nblock)`.
+- Dense SVD now scales inputs near the floating-point range limits before QR
+  or bidiagonalization, restoring the original scale in the returned singular
+  values (#227).
+
+## Added
+
+- Polar decomposition, `linalg::polar` (#60): `left_polar` (`A = W P`, `m >= n`) and
+  `right_polar` (`A = P W^H`, `m <= n`) with the conventions of MatrixAlgebraKit.jl, exact
+  scratch queries and `Par`, for f32, f64, c32 and c64. `PolarParams::method` selects the thin
+  SVD (the default) or QDWH, which uses only column-pivoted QR, Cholesky and matrix products.
 
 ## Added
 

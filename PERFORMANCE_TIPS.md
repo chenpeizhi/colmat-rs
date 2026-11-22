@@ -37,6 +37,22 @@ SVD driver pads its work copy by 64 bytes per column when the stride would be a 
 (`svd/mod.rs` `work_rows`): 18.6 -> 15.3 ms at eight threads. Benchmark shapes are powers of two,
 so this is where it shows; a vendor's `?gebrd` at 512 matches our 500.
 
+## Move a strided pass into the sweep that already streams the data
+
+A pass over one row of a column-major matrix costs a line per column, and at a 4 KiB leading
+dimension those lines share a set; done every step it can be a third of the call (full-pivot LU,
+the pivot row swap at f64 512). The columns that a later step reads are being streamed anyway by
+the step's own update, so their entries can be swapped there; the columns no later step reads can
+wait for one column-wise pass at the end. Two details decide whether it pays: make the scalar
+store one column ahead of the vector loads that read the same column (otherwise the loads wait on
+it: f64 n = 32 went 10.7 -> 17.1 us before the lag, 11.9 after), and keep every per-element
+operation as it was, so the result keeps its bits (`docs/worklogs/2026-11-19-lu-eigh-fullpiv-shapes.md`).
+
+The same reordering applies to a sequence of rotations: apply a chunk of them to a strip of rows
+held in registers instead of one rotation to two whole columns. Bound the chunk: a strip that walks
+every column of a block inside a 512-row matrix walks columns 4 KiB apart (8 rotations per chunk;
+the whole sweep at once was 16 % slower at n = 512).
+
 ## The team is the caller's, and it is held across the work
 
 `Par::Team` is the exclusive authority over the reserved members of a `threadteam` team. A reserved
@@ -88,6 +104,22 @@ caller granted. Rayon itself is a private pool in this fork (`threadteam` builds
 `rayon::ThreadPool` and never starts the process-global one), so driving the iterator with rayon
 (`.for_each`, `rayon::join`) instead of handing it to `utils::thread` is what leaves the token's
 members for the calling thread's registry.
+
+## A team member must start its job with a clean upper vector state
+
+The `t4a-private-gemm-x86` kernels are assembly that return without `vzeroupper`. Compiled code
+clears the state whenever it leaves an AVX function, so the leader is cleaned as a side effect; a
+member goes back to `threadteam`'s wait loop, which has no AVX code, and starts its next job dirty.
+In that state every legacy-SSE scalar instruction carries a false dependency on its destination's
+upper bits: independent scalar work (the D&C's secular roots, divisions over the poles) ran 3.7
+times slower on a member, while a dependent chain was unaffected, so a region that scales badly
+only in its scalar part can be this rather than load imbalance. `team::end_of_job` clears it on
+every participant (`docs/worklogs/2026-11-19-eigh-dirty-upper-state.md`: `eigh` 4T n = 512
+23.8 -> 15.1 ms). `XGETBV(1)` bits 2 and 6 show the state, and a test reads them; any new path that
+hands work to a member outside `utils::team` needs the same clear. Clearing on sequential calls
+buys nothing, and a 5-7 % shift on a sequential cell after such a change is worth rebuilding with
+`-C llvm-args=-align-loops=64` before believing it: loop placement moved the c64 bidiagonalisation
+by that much with no changed code on its path.
 
 ## A region costs about 1.5 us on a team, and a threaded gemv of 512 is 6 us
 
@@ -155,3 +187,14 @@ arithmetic or introducing partial matrices. Count the actual non-deflated
 poles, not the original dimension, when estimating their work. The experimental
 repair-only whole-call ratio was 0.7502; portability and 64-core acceptance are
 still unverified (`docs/worklogs/2026-11-14-eigh-parallel-repair.md`).
+
+## Below the blocking sizes, the block apply's calls are the cost
+
+A blocked factorization at `n = 32` (block width 4) is dozens of products of a few hundred
+multiply-adds; `nano_gemm` runs them at 6-8 GMAC/s on Zen 5 (AVX2) and the colmat wrapper adds
+little, so neither the team grid nor the wrapper is the lever. A level-2 sweep with one SIMD
+dispatch per reflector, several target columns per step so their reductions overlap, and two
+reflectors per sweep cut `qr_factor` by 41-55% at 32-96 (`docs/worklogs/2026-11-22-small-qr-level2.md`). Check
+whether one thread is as slow as eight before blaming the split: there it was 16.7 against 17.4 us.
+Gate such a path by work on a team (a complex multiply-add is about four real ones), and keep a
+consumer that is one wide product (a single wide block) on the team route.
